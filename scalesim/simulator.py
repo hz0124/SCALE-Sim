@@ -106,6 +106,10 @@ class simulator:
 
             single_layer_obj.run()
 
+            # Accelergy hook (port from upstream PR#7). Generates per-layer
+            # action_count.yaml in self.top_path; no-op if accelergy is disabled.
+            single_layer_obj.run_energy_model(self.top_path)
+
             if self.verbose:
                 comp_items = single_layer_obj.get_compute_report_items()
                 total_cycles = comp_items[0]
