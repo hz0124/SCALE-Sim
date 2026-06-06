@@ -181,5 +181,77 @@ Precision per sub-run is sniffed from the SCALE-Sim `.cfg` filename suffix
 (`*_fp16.cfg` / `*_int8.cfg` / `*_int4.cfg`); ARGUS picks the right pJ key
 automatically so you don't have to.
 
+### Cross-validation against accelergy CLI (`--validate`)
+
+For reviewer-ready sanity checks, add `--validate` on top of `--energy`:
+
+```bash
+python run_bagel.py --hw ours --task MM --config <cfg> --energy --validate
+```
+
+This picks the **top-3 highest-energy sub-runs** (typically `ffn_up`,
+`ffn_down`, and a representative `attn`) and re-computes each one through
+the standalone Accelergy + CACTI + Aladdin toolchain, then appends a
+`CROSS-VALIDATION` section to `results.log`. Output looks like:
+
+```
+CROSS-VALIDATION (accelergy CLI):
+  Note: accelergy uses tile-down sampling + leak/idle scaling.
+  Its numbers are an upper bound (include PE leak even for
+  inactive cycles); EnergyAccountant's fast path is the
+  dynamic-access lower bound. Real silicon sits between.
+
+  Sample 1 (text/ffn_down, M=1, N=3584, K=18944, int4, x560):
+    EnergyAccountant:    598.558 mJ  (dynamic only)
+    accelergy:         40712.988 mJ  (with leak/idle)
+    ratio:                      68.0x  (per-tile  17543.9 nJ × scale 2320640)
+  ...
+  Mean ratio (accelergy / EnergyAccountant): 68.0x
+  → OK — leak/idle accounts for the gap (expected for tile-sampling)
+```
+
+**How to read the ratio.** Don't expect 1.0x — the two tools answer
+different questions:
+
+- **EnergyAccountant** (the `--energy` fast-path) reports *dynamic
+  access* energy: pJ per MAC, per SRAM-byte, and per DRAM-bit, summed
+  across actual access counts. No leakage, no idle background. This is
+  the **lower bound**.
+- **accelergy** reports the full Accelergy / CACTI / Aladdin estimate,
+  which adds per-PE leak + idle for *every* clock the simulated
+  accelerator is alive. Because we tile-down the sample GEMM to keep
+  the run fast (1×128×128 instead of e.g. 1×3584×18944, see
+  `_tile_down` in `validate.py`), the leak component gets multiplied
+  by the same volume-restoration factor — pushing ratios into the
+  10×–100× range. This is a **leak-dominated upper bound**.
+- **Real silicon** sits in between, depending on activity factor and
+  clock-gating effectiveness.
+
+**What ratios mean in practice:**
+
+| Mean ratio | Verdict |
+|---|---|
+| 1× – 1.5× | Fast path is well calibrated, both tools agree |
+| 10× – 100× | Normal for ARGUS — leak overhead from 1024 PEs dominates |
+| Wildly inconsistent across the 3 samples | Investigate: likely a bug in `_record_energy` multiplicity or label routing |
+| Ratio drifts run-to-run | Check that `hw_cfg_path` (sniffed in `_record_energy`) is stable |
+
+**Cost.** Each sample spawns a 1×128×128 SCALE-Sim run + a fresh
+accelergy invocation, ~5 s each. Three samples + setup ≈ 5–8 minutes
+on top of the base simulation.
+
+**Caveats.**
+- The 28nm baseline pJ table is *literature-derived*. If you want
+  CACTI-derived SRAM/DRAM numbers as your fast-path coefficients,
+  read CACTI yourself (e.g. for a 64 KB SRAM at 28nm) and override
+  via `energy_coefficients` in the workload JSON. `--validate`
+  doesn't update the table for you.
+- The `--validate` path requires Accelergy + accelergy-cacti-plug-in
+  + accelergy-aladdin-plug-in installed in the active conda env.
+  Source clones are typically under `~/.local/src/accelergy-stack/`.
+- `rundir-accelergy/` must contain its full upstream content
+  (`preprocess.py`, the `accelergy_input/components/*.yaml` library,
+  etc.) — these were imported in the Phase A commit `b504b5c`.
+
 ### Acknowledgement
 This project is based on [SCALE-Sim](https://github.com/scalesim-project/SCALE-Sim) (Systolic CNN Accelerator Simulator).
