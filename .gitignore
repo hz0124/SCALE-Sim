@@ -28,3 +28,11 @@ configs_test
 benchmark_results
 .vscode*
 results*
+__pycache__/
+
+# Accelergy runtime products: regenerated every run_all.sh invocation.
+# create_action_count.sh / run_accelergy.sh are intentionally tracked as
+# empty placeholders (preprocess.py rewrites them per-run from cfg).
+rundir-accelergy/accelergy_input/architecture.yaml
+rundir-accelergy/accelergy_input/action_count.yaml
+rundir-accelergy/accelergy_output/
