@@ -68,6 +68,8 @@ class Bagel_sim():
         self.dram_type = None           # JSON "dram_type", default in coefficients.py
         self.coef_overrides = None      # JSON "energy_coefficients"
         self._last_run_detail_csv = None  # set by run_sim_once
+        self.energy_validate = False    # set by --validate; runs accelergy CLI
+                                        # cross-check on top-N sub-runs at end
 
 
     def setup_energy(self, hw_type=None):
@@ -90,7 +92,8 @@ class Bagel_sim():
 
 
     def _record_energy(self, M, N, K, precision="fp16", scale=1.0,
-                       multiplicity=1, detail_csv=None, prefer_csv=False):
+                       multiplicity=1, label=None, hw_cfg_path=None,
+                       detail_csv=None, prefer_csv=False):
         """
         Add one sub-run's MAC + SRAM + DRAM access to self.energy.
 
@@ -108,6 +111,11 @@ class Bagel_sim():
                         per-step attention by num_layer × step_cnts × num_head_q.
                         ARGUS's cycle accumulation already applies the same
                         factor to cycles; multiplicity makes energy parallel.
+            label:      Short human-readable tag (e.g. 'qkv', 'attn_qk',
+                        'ffn_up'). Used in F7 cross-validation output.
+            hw_cfg_path: SCALE-Sim cfg path for this sub-run (e.g.
+                        'configs/bagel/ours_int4.cfg'). Needed by F7
+                        validate to spawn accelergy with matching hw.
             detail_csv: path to a SCALE-Sim DETAILED_ACCESS_REPORT.csv. When
                         prefer_csv=True, access counts come from there;
                         otherwise from geometry. Defaults to
@@ -128,6 +136,10 @@ class Bagel_sim():
 
         # Combined factor: per-sub-run scale × outer multiplicity.
         total_factor = float(scale) * float(multiplicity)
+
+        # Snapshot energy before adding so we can attribute this sub-run's
+        # contribution to the F7 audit trail.
+        before_pJ = self.energy.total_pJ() if (label or hw_cfg_path) else 0.0
 
         # MAC ops: always M*N*K * total_factor (more reliable than the
         # SCALE-Sim CSV PE-level Read Count, which is biased by col_fold).
@@ -160,6 +172,17 @@ class Bagel_sim():
                 self.energy.add_dram_access(
                     kind, words=counts[f"dram_{kind}_reads"],
                     word_bytes=word_bytes, op="read")
+
+        # Audit trail entry: subtotal_pJ = (after - before) gives this call's
+        # net contribution, regardless of which buckets it touched.
+        if label or hw_cfg_path:
+            self.energy.record_subrun(
+                label=label or f"{M}x{N}x{K}",
+                M=M, N=N, K=K, precision=precision,
+                multiplicity=multiplicity, scale=scale,
+                hw_cfg_path=hw_cfg_path,
+                subtotal_pJ=self.energy.total_pJ() - before_pJ,
+            )
 
 
     def read_from_json(self, cfg_path=None):
@@ -405,28 +428,32 @@ class Bagel_sim():
         input_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='qkv', config=self.config_comm0)
         input_cycles = input_tile_cycles * (self.dim + self.num_head_kv * self.head_dim * 2) / self.tile
         self._record_energy(M=1, N=qkv_N, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/qkv", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
 
         self._append_to_log(f"Text generation - Start output mapping")
         output_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='omap', config=self.config_comm0)
         output_cycles = output_tile_cycles * self.dim / self.tile
         self._record_energy(M=1, N=self.dim, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/omap", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End output mapping, total cycles:{output_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN up")
         ffn_up_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_up', config=self.config_comm0)
         ffn_up_cycles = ffn_up_tile_cycles * self.upshape / self.tile
         self._record_energy(M=1, N=self.upshape, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/ffn_up", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End FFN up, total cycles:{ffn_up_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN down")
         ffn_down_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_down', config=self.config_comm0)
         ffn_down_cycles = ffn_down_tile_cycles * self.dim / self.tile
         self._record_energy(M=1, N=self.dim, K=self.upshape,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/ffn_down", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End FFN down, total cycles:{ffn_down_cycles}")
 
         for step in range(0, self.gen_text_len, self.sample_rate):
@@ -465,9 +492,11 @@ class Bagel_sim():
             # Multiplicity per attn sub-run = num_layer * step_cnts * num_head_q.
             attn_mult = self.num_layer * step_cnts * self.num_head_q
             self._record_energy(M=1, N=kv_len, K=self.head_dim,
-                                precision=prec_comm1, multiplicity=attn_mult)
+                                precision=prec_comm1, multiplicity=attn_mult,
+                                label=f"text/attn_qk(kv={kv_len})", hw_cfg_path=self.config_comm1)
             self._record_energy(M=1, N=self.head_dim, K=kv_len,
-                                precision=prec_comm1, multiplicity=attn_mult)
+                                precision=prec_comm1, multiplicity=attn_mult,
+                                label=f"text/attn_sfmxv(kv={kv_len})", hw_cfg_path=self.config_comm1)
 
 
         text_total_cycles = self.total_cycles_all - text_start_cycles
@@ -648,21 +677,27 @@ class Bagel_sim():
         # Real text-side QKV: 3 GEMMs (Q/K/V). M=text_attn, N=dim or num_head_kv*head_dim, K=dim.
         kv_proj_N = self.num_head_kv * self.head_dim
         self._record_energy(M=self.text_attn, N=self.dim, K=self.dim,
-                            precision=prec_comm0, multiplicity=per_image_mult)         # Q
+                            precision=prec_comm0, multiplicity=per_image_mult,
+                            label="img/qkv_text_Q", hw_cfg_path=self.config_comm0)
         self._record_energy(M=self.text_attn, N=kv_proj_N, K=self.dim,
-                            precision=prec_comm0, multiplicity=per_image_mult)         # K
+                            precision=prec_comm0, multiplicity=per_image_mult,
+                            label="img/qkv_text_K", hw_cfg_path=self.config_comm0)
         self._record_energy(M=self.text_attn, N=kv_proj_N, K=self.dim,
-                            precision=prec_comm0, multiplicity=per_image_mult)         # V
+                            precision=prec_comm0, multiplicity=per_image_mult,
+                            label="img/qkv_text_V", hw_cfg_path=self.config_comm0)
 
         input_cycles_image = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='qkv')
         # Image-side QKV from run_sim_once_comp: Q (vae_attn × dim × dim) + 2*KV
         # (vae_attn × num_head_kv*head_dim × dim).
         self._record_energy(M=self.vae_attn, N=self.dim, K=self.dim,
-                            precision=prec_comp0, multiplicity=per_image_mult)         # Q image
+                            precision=prec_comp0, multiplicity=per_image_mult,
+                            label="img/qkv_image_Q", hw_cfg_path=self.config_comp0)
         self._record_energy(M=self.vae_attn, N=kv_proj_N, K=self.dim,
-                            precision=prec_comp0, multiplicity=per_image_mult)         # K image
+                            precision=prec_comp0, multiplicity=per_image_mult,
+                            label="img/qkv_image_K", hw_cfg_path=self.config_comp0)
         self._record_energy(M=self.vae_attn, N=kv_proj_N, K=self.dim,
-                            precision=prec_comp0, multiplicity=per_image_mult)         # V image
+                            precision=prec_comp0, multiplicity=per_image_mult,
+                            label="img/qkv_image_V", hw_cfg_path=self.config_comp0)
 
         input_cycles = input_cycles_text + input_cycles_image
         self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
@@ -671,14 +706,16 @@ class Bagel_sim():
         output_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='omap')
         # Omap: M=image_input_len, N=dim, K=dim
         self._record_energy(M=self.image_input_len, N=self.dim, K=self.dim,
-                            precision=prec_comp0, multiplicity=per_image_mult)
+                            precision=prec_comp0, multiplicity=per_image_mult,
+                            label="img/omap", hw_cfg_path=self.config_comp0)
         self._append_to_log(f"Image generation - End output mapping, total cycles:{output_cycles}")
 
         self._append_to_log(f"Image generation - Start FFN down")
         ffn_down_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_down')
         # FFN-down: M=image_input_len, N=dim, K=upshape
         self._record_energy(M=self.image_input_len, N=self.dim, K=self.upshape,
-                            precision=prec_comp0, multiplicity=per_image_mult)
+                            precision=prec_comp0, multiplicity=per_image_mult,
+                            label="img/ffn_down", hw_cfg_path=self.config_comp0)
         self._append_to_log(f"Image generation - End FFN down, total cycles:{ffn_down_cycles}")
 
         self._append_to_log(f"Image generation - Start draining")
@@ -709,9 +746,13 @@ class Bagel_sim():
             #   ffn_up: depends on which_ffn (image_only/text_only mask).
             attn_mult = self.num_layer * self.num_head_q * n_steps
             self._record_energy(M=self.image_input_len, N=kv_len, K=self.head_dim,
-                                precision=prec_comp0, multiplicity=attn_mult)
+                                precision=prec_comp0, multiplicity=attn_mult,
+                                label=f"img/attn_qk({config_name},kv={kv_len})",
+                                hw_cfg_path=self.config_comp0)
             self._record_energy(M=self.image_input_len, N=self.head_dim, K=kv_len,
-                                precision=prec_comp0, multiplicity=attn_mult)
+                                precision=prec_comp0, multiplicity=attn_mult,
+                                label=f"img/attn_sfmxv({config_name},kv={kv_len})",
+                                hw_cfg_path=self.config_comp0)
 
             # FFN-up has variable layer_input (which_ffn dampens it via
             # image_only_sim / text_only_sim). We mirror the cycle calc.
@@ -723,11 +764,15 @@ class Bagel_sim():
                 layer_eff = self.image_input_len
             ffn_up_mult = self.num_layer * n_steps  # per-config, no num_head
             self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
-                                precision=prec_comp0, multiplicity=ffn_up_mult)
+                                precision=prec_comp0, multiplicity=ffn_up_mult,
+                                label=f"img/ffn_up_gate({config_name})",
+                                hw_cfg_path=self.config_comp0)
             # ARGUS multiplies ffn_up_cycles by 2 in the cycle calc (gate +
             # up projections), so we record ffn_up's energy twice.
             self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
-                                precision=prec_comp0, multiplicity=ffn_up_mult)
+                                precision=prec_comp0, multiplicity=ffn_up_mult,
+                                label=f"img/ffn_up_proj({config_name})",
+                                hw_cfg_path=self.config_comp0)
 
             self._append_to_log(f"Image generation - {config_name} config completed, cycles: {config_cycles}")
 
@@ -784,6 +829,21 @@ class Bagel_sim():
         if self.energy_enabled and self.energy is not None:
             self.energy.add_cycles(int(self.total_cycles_all))
             self._append_to_log(self.energy.format_report())
+
+            # F7: optional accelergy cross-validation on top-N sub-runs.
+            if self.energy_validate:
+                self._append_to_log("Running F7 cross-validation (this may take ~10-30s)...")
+                from simulation_core.energy_accounting.validate import (
+                    cross_validate_top_records, format_validation_report
+                )
+                top = self.energy.top_records_by_energy(n=3)
+                results = cross_validate_top_records(
+                    records=top,
+                    coefficients=self.energy.coef,
+                    ours_log_dir=self.log_path,
+                    argus_root=PROJECT_ROOT,
+                )
+                self._append_to_log(format_validation_report(results))
         self._append_to_log("======= Bagel Model Simulation Completed =======")
         
         return self.total_cycles_all

@@ -59,6 +59,15 @@ class EnergyAccountant:
         self.dram_byte_words = defaultdict(int)
         self.cycles_total = 0
 
+        # Per-sub-run audit trail (Phase F7). Each entry summarizes one
+        # _record_energy call from Bagel_sim/Janus_sim:
+        #   {"label": str, "M": int, "N": int, "K": int, "precision": str,
+        #    "multiplicity": int, "scale": float, "hw_cfg_path": str,
+        #    "subtotal_pJ": float}
+        # Used by validate.py to pick the top-N highest-energy sub-runs
+        # for accelergy CLI cross-validation.
+        self.records = []
+
     # ------------------------------------------------------------------ ops
 
     def add_mac_ops(self, count, precision="fp16"):
@@ -98,6 +107,31 @@ class EnergyAccountant:
         """Add cycles to the running total. Used for idle-DRAM background."""
         if n > 0:
             self.cycles_total += int(n)
+
+    def record_subrun(self, label, M, N, K, precision, multiplicity, scale,
+                      hw_cfg_path, subtotal_pJ):
+        """
+        Append one entry to the per-sub-run audit trail. Called by
+        Bagel_sim/Janus_sim._record_energy after the access counts have
+        been added, with the energy that *this* call contributed.
+
+        The audit trail is consumed by validate.py to pick the top-N
+        highest-energy sub-runs for accelergy CLI cross-validation; the
+        accumulated counts above are unaffected.
+        """
+        self.records.append({
+            "label": label,
+            "M": int(M), "N": int(N), "K": int(K),
+            "precision": precision,
+            "multiplicity": int(multiplicity),
+            "scale": float(scale),
+            "hw_cfg_path": hw_cfg_path,
+            "subtotal_pJ": float(subtotal_pJ),
+        })
+
+    def top_records_by_energy(self, n=3):
+        """Return the top-N records by subtotal_pJ, descending."""
+        return sorted(self.records, key=lambda r: r["subtotal_pJ"], reverse=True)[:n]
 
     # -------------------------------------------------------- energy compute
 

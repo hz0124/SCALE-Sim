@@ -68,6 +68,7 @@ class Janus_sim():
         self.dram_type = None
         self.coef_overrides = None
         self._last_run_detail_csv = None
+        self.energy_validate = False    # set by --validate
 
 
     def setup_energy(self, hw_type=None):
@@ -86,7 +87,8 @@ class Janus_sim():
 
 
     def _record_energy(self, M, N, K, precision="fp16", scale=1.0,
-                       multiplicity=1, detail_csv=None, prefer_csv=False):
+                       multiplicity=1, label=None, hw_cfg_path=None,
+                       detail_csv=None, prefer_csv=False):
         """Add one sub-run's MAC + SRAM + DRAM access to self.energy.
         See Bagel_sim._record_energy for full docstring; identical semantics.
         """
@@ -102,6 +104,7 @@ class Janus_sim():
             detail_csv = self._last_run_detail_csv
 
         total_factor = float(scale) * float(multiplicity)
+        before_pJ = self.energy.total_pJ() if (label or hw_cfg_path) else 0.0
         self.energy.add_mac_ops(int(M * N * K * total_factor), precision=precision)
 
         if prefer_csv and detail_csv is not None and os.path.exists(detail_csv):
@@ -129,6 +132,15 @@ class Janus_sim():
                 self.energy.add_dram_access(
                     kind, words=counts[f"dram_{kind}_reads"],
                     word_bytes=word_bytes, op="read")
+
+        if label or hw_cfg_path:
+            self.energy.record_subrun(
+                label=label or f"{M}x{N}x{K}",
+                M=M, N=N, K=K, precision=precision,
+                multiplicity=multiplicity, scale=scale,
+                hw_cfg_path=hw_cfg_path,
+                subtotal_pJ=self.energy.total_pJ() - before_pJ,
+            )
 
 
     def read_from_json(self, cfg_path=None):
@@ -359,27 +371,31 @@ class Janus_sim():
         once_mult = self.num_layer * self.gen_text_len
         qkv_N = self.dim + 2 * self.num_head_kv * self.head_dim
         self._record_energy(M=1, N=qkv_N, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/qkv", hw_cfg_path=self.config_comm0)
 
         self._append_to_log(f"Text generation - Start output mapping")
         output_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='omap', config=self.config_comm0)
         output_cycles = output_tile_cycles * self.dim / self.tile
         self._record_energy(M=1, N=self.dim, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/omap", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End output mapping, total cycles:{output_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN up")
         ffn_up_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_up', config=self.config_comm0)
         ffn_up_cycles = ffn_up_tile_cycles * self.upshape / self.tile
         self._record_energy(M=1, N=self.upshape, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/ffn_up", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End FFN up, total cycles:{ffn_up_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN down")
         ffn_down_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_down', config=self.config_comm0)
         ffn_down_cycles = ffn_down_tile_cycles * self.dim / self.tile
         self._record_energy(M=1, N=self.dim, K=self.upshape,
-                            precision=prec_comm0, multiplicity=once_mult)
+                            precision=prec_comm0, multiplicity=once_mult,
+                            label="text/ffn_down", hw_cfg_path=self.config_comm0)
         self._append_to_log(f"Text generation - End FFN down, total cycles:{ffn_down_cycles}")
 
         for step in range(0, self.gen_text_len, self.sample_rate):
@@ -415,9 +431,11 @@ class Janus_sim():
             # Energy: per-step attention (multiplicity = num_layer × step_cnts × num_head_q).
             attn_mult = self.num_layer * step_cnts * self.num_head_q
             self._record_energy(M=1, N=kv_len, K=self.head_dim,
-                                precision=prec_comm1, multiplicity=attn_mult)
+                                precision=prec_comm1, multiplicity=attn_mult,
+                                label=f"text/attn_qk(kv={kv_len})", hw_cfg_path=self.config_comm1)
             self._record_energy(M=1, N=self.head_dim, K=kv_len,
-                                precision=prec_comm1, multiplicity=attn_mult)
+                                precision=prec_comm1, multiplicity=attn_mult,
+                                label=f"text/attn_sfmxv(kv={kv_len})", hw_cfg_path=self.config_comm1)
 
 
         text_total_cycles = self.total_cycles_all - text_start_cycles
@@ -583,11 +601,14 @@ class Janus_sim():
             input_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='qkv', image_input=input_len)
             # qkv: Q (input_len, dim, dim) + 2× KV (input_len, num_head_kv·head_dim, dim)
             self._record_energy(M=input_len, N=self.dim, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/qkv_Q({config_name})", hw_cfg_path=self.config_comp0)
             self._record_energy(M=input_len, N=kv_proj_N, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/qkv_K({config_name})", hw_cfg_path=self.config_comp0)
             self._record_energy(M=input_len, N=kv_proj_N, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/qkv_V({config_name})", hw_cfg_path=self.config_comp0)
             self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
             config_cycles_iter += input_cycles
 
@@ -596,16 +617,21 @@ class Janus_sim():
             attn_cycles = attn_single_cycles * self.num_head_q
             # attn: 2 GEMMs per head, multiplied by num_head_q in cycle math
             self._record_energy(M=input_len, N=kv_len, K=self.head_dim,
-                                precision=prec_comp0, multiplicity=attn_mult)
+                                precision=prec_comp0, multiplicity=attn_mult,
+                                label=f"img/attn_qk({config_name},kv={kv_len})",
+                                hw_cfg_path=self.config_comp0)
             self._record_energy(M=input_len, N=self.head_dim, K=kv_len,
-                                precision=prec_comp0, multiplicity=attn_mult)
+                                precision=prec_comp0, multiplicity=attn_mult,
+                                label=f"img/attn_sfmxv({config_name},kv={kv_len})",
+                                hw_cfg_path=self.config_comp0)
             self._append_to_log(f"Image generation - End attn, total cycles:{attn_cycles}")
             config_cycles_iter += attn_cycles
 
             self._append_to_log(f"Image generation - Start output mapping")
             output_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='omap', image_input=input_len)
             self._record_energy(M=input_len, N=self.dim, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/omap({config_name})", hw_cfg_path=self.config_comp0)
             self._append_to_log(f"Image generation - End output mapping, total cycles:{output_cycles}")
             config_cycles_iter += output_cycles
 
@@ -619,16 +645,22 @@ class Janus_sim():
             else:
                 layer_eff = input_len
             self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/ffn_up_gate({config_name})",
+                                hw_cfg_path=self.config_comp0)
             self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/ffn_up_proj({config_name})",
+                                hw_cfg_path=self.config_comp0)
             self._append_to_log(f"Image generation - End FFN up, total cycles:{ffn_up_cycles}")
             config_cycles_iter += ffn_up_cycles
 
             self._append_to_log(f"Image generation - Start FFN down")
             ffn_down_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_down', image_input=input_len)
             self._record_energy(M=input_len, N=self.dim, K=self.upshape,
-                                precision=prec_comp0, multiplicity=per_cfg_mult)
+                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                label=f"img/ffn_down({config_name})",
+                                hw_cfg_path=self.config_comp0)
             self._append_to_log(f"Image generation - End FFN down, total cycles:{ffn_down_cycles}")
             config_cycles_iter += ffn_down_cycles
             
@@ -689,6 +721,20 @@ class Janus_sim():
         if self.energy_enabled and self.energy is not None:
             self.energy.add_cycles(int(self.total_cycles_all))
             self._append_to_log(self.energy.format_report())
+
+            if self.energy_validate:
+                self._append_to_log("Running F7 cross-validation (this may take ~10-30s)...")
+                from simulation_core.energy_accounting.validate import (
+                    cross_validate_top_records, format_validation_report
+                )
+                top = self.energy.top_records_by_energy(n=3)
+                results = cross_validate_top_records(
+                    records=top,
+                    coefficients=self.energy.coef,
+                    ours_log_dir=self.log_path,
+                    argus_root=PROJECT_ROOT,
+                )
+                self._append_to_log(format_validation_report(results))
         self._append_to_log("======= Bagel Model Simulation Completed =======")
         
         return self.total_cycles_all
