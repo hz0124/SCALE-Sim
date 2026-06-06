@@ -60,6 +60,76 @@ class Janus_sim():
         self.text_gen_finished_flag = False
         self.text_gen_cycles = 0
 
+        # Energy accounting (Phase F). Disabled by default; opt-in via
+        # CLI --energy or JSON "energy_enabled": true. Mirrors Bagel_sim;
+        # see simulation_core/energy_accounting/.
+        self.energy_enabled = False
+        self.energy = None
+        self.dram_type = None
+        self.coef_overrides = None
+        self._last_run_detail_csv = None
+
+
+    def setup_energy(self, hw_type=None):
+        """Instantiate self.energy. Idempotent."""
+        if self.energy is not None:
+            return
+        from simulation_core.energy_accounting.coefficients import get_coefficients
+        from simulation_core.energy_accounting.accountant import EnergyAccountant
+        coef = get_coefficients(
+            hw_type or self.hardware_type,
+            json_overrides=self.coef_overrides,
+            dram_type=self.dram_type,
+        )
+        self.energy = EnergyAccountant(coef)
+        self.energy_enabled = True
+
+
+    def _record_energy(self, M, N, K, precision="fp16", scale=1.0,
+                       multiplicity=1, detail_csv=None, prefer_csv=False):
+        """Add one sub-run's MAC + SRAM + DRAM access to self.energy.
+        See Bagel_sim._record_energy for full docstring; identical semantics.
+        """
+        if not self.energy_enabled or self.energy is None:
+            return
+        if multiplicity <= 0:
+            return
+        from simulation_core.energy_accounting.extractors import (
+            from_geometric_estimate, from_scalesim_reports
+        )
+
+        if detail_csv is None:
+            detail_csv = self._last_run_detail_csv
+
+        total_factor = float(scale) * float(multiplicity)
+        self.energy.add_mac_ops(int(M * N * K * total_factor), precision=precision)
+
+        if prefer_csv and detail_csv is not None and os.path.exists(detail_csv):
+            counts = from_scalesim_reports(detail_csv, scale=total_factor)
+        else:
+            counts = from_geometric_estimate(
+                M, N, K, self.array_height or 32, self.array_width or 32
+            )
+            counts = {k: int(v * total_factor) for k, v in counts.items()}
+
+        word_bytes = {"fp16": 2.0, "int8": 1.0, "int4": 0.5}.get(precision, 2.0)
+
+        for kind in ("ifmap", "filter", "ofmap"):
+            if kind == "ofmap":
+                self.energy.add_sram_access(
+                    kind, words=counts["sram_ofmap_writes"],
+                    word_bytes=word_bytes, op="write")
+                self.energy.add_dram_access(
+                    kind, words=counts["dram_ofmap_writes"],
+                    word_bytes=word_bytes, op="write")
+            else:
+                self.energy.add_sram_access(
+                    kind, words=counts[f"sram_{kind}_reads"],
+                    word_bytes=word_bytes, op="read")
+                self.energy.add_dram_access(
+                    kind, words=counts[f"dram_{kind}_reads"],
+                    word_bytes=word_bytes, op="read")
+
 
     def read_from_json(self, cfg_path=None):
         if cfg_path is None:
@@ -128,6 +198,12 @@ class Janus_sim():
 
         self.text_gen_cycles = cfg.get("text_gen_cycles", 0)
         self.tile = cfg.get("tile", self.tile)
+
+        # Energy accounting (Phase F)
+        if cfg.get("energy_enabled", False):
+            self.energy_enabled = True
+        self.dram_type = cfg.get("dram_type", self.dram_type)
+        self.coef_overrides = cfg.get("energy_coefficients", self.coef_overrides)
 
     def build_topologies(self, kv_len=0, is_gen_text=True, part='all'):
         """
@@ -233,6 +309,17 @@ class Janus_sim():
 
         results = s.run_scale(top_path=self.log_path)
 
+        # Energy accounting hook (Phase F): stash detail csv for prefer_csv mode.
+        self._last_run_detail_csv = None
+        if self.energy_enabled:
+            try:
+                run_name = s.config.get_run_name()
+                self._last_run_detail_csv = os.path.join(
+                    self.log_path, run_name, "DETAILED_ACCESS_REPORT.csv"
+                )
+            except Exception:
+                self._last_run_detail_csv = None
+
         # 解包结果，获取总周期数
         if isinstance(results, (tuple, list)) and len(results) >= 1:
             return results[0]  # 返回总周期数
@@ -265,19 +352,34 @@ class Janus_sim():
         input_cycles = input_tile_cycles * (self.dim + self.num_head_kv * self.head_dim * 2) / self.tile
         self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
 
+        # Energy: precision tags + once-only multiplicities (mirrors Bagel).
+        from simulation_core.energy_accounting.coefficients import precision_from_config_path
+        prec_comm0 = precision_from_config_path(self.config_comm0)
+        prec_comm1 = precision_from_config_path(self.config_comm1)
+        once_mult = self.num_layer * self.gen_text_len
+        qkv_N = self.dim + 2 * self.num_head_kv * self.head_dim
+        self._record_energy(M=1, N=qkv_N, K=self.dim,
+                            precision=prec_comm0, multiplicity=once_mult)
+
         self._append_to_log(f"Text generation - Start output mapping")
         output_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='omap', config=self.config_comm0)
         output_cycles = output_tile_cycles * self.dim / self.tile
+        self._record_energy(M=1, N=self.dim, K=self.dim,
+                            precision=prec_comm0, multiplicity=once_mult)
         self._append_to_log(f"Text generation - End output mapping, total cycles:{output_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN up")
         ffn_up_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_up', config=self.config_comm0)
         ffn_up_cycles = ffn_up_tile_cycles * self.upshape / self.tile
+        self._record_energy(M=1, N=self.upshape, K=self.dim,
+                            precision=prec_comm0, multiplicity=once_mult)
         self._append_to_log(f"Text generation - End FFN up, total cycles:{ffn_up_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN down")
         ffn_down_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_down', config=self.config_comm0)
         ffn_down_cycles = ffn_down_tile_cycles * self.dim / self.tile
+        self._record_energy(M=1, N=self.dim, K=self.upshape,
+                            precision=prec_comm0, multiplicity=once_mult)
         self._append_to_log(f"Text generation - End FFN down, total cycles:{ffn_down_cycles}")
 
         for step in range(0, self.gen_text_len, self.sample_rate):
@@ -286,7 +388,7 @@ class Janus_sim():
             else:
                 step_end = step + self.sample_rate - 1
 
-            len_average = (step + step_end) // 2   
+            len_average = (step + step_end) // 2
             kv_len = self.kv_cache_init + step + len_average + 1
 
             self._append_to_log(f"Text generation - Step {step} to Step {step_end} started (kv_len in averagr: {kv_len})")
@@ -309,6 +411,13 @@ class Janus_sim():
             step_cnts = step_end - step + 1
             step_cycles_total = step_cycles * step_cnts
             self.total_cycles_all += step_cycles_total
+
+            # Energy: per-step attention (multiplicity = num_layer × step_cnts × num_head_q).
+            attn_mult = self.num_layer * step_cnts * self.num_head_q
+            self._record_energy(M=1, N=kv_len, K=self.head_dim,
+                                precision=prec_comm1, multiplicity=attn_mult)
+            self._record_energy(M=1, N=self.head_dim, K=kv_len,
+                                precision=prec_comm1, multiplicity=attn_mult)
 
 
         text_total_cycles = self.total_cycles_all - text_start_cycles
@@ -445,6 +554,15 @@ class Janus_sim():
 
         total_image_cycles = 0
 
+        # Energy bookkeeping (Phase F): Janus's image gen has 2 kv_configs.
+        # Each config has its own input_len (full_cache: kv_init + gen_text_len + image_input_len;
+        # without_text: image_input_len). Sub-runs inside the for-loop run once per
+        # config, so per-config multiplicity = num_layer × gen_image_step.
+        from simulation_core.energy_accounting.coefficients import precision_from_config_path
+        prec_comp0 = precision_from_config_path(self.config_comp0)
+        n_steps = self.gen_image_step
+        kv_proj_N = self.num_head_kv * self.head_dim
+
         self._append_to_log(f"Image generation - Start prefetching")
         prefetch_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='prefetch', image_input=input_normal)
         self._append_to_log(f"Image generation - End prefetching, total cycles:{prefetch_cycles}")
@@ -457,30 +575,60 @@ class Janus_sim():
 
         for config_name, kv_len, input_len in kv_configs:
             self._append_to_log(f"Image generation - {config_name} config started (kv_len: {kv_len})")
+            per_cfg_mult = self.num_layer * n_steps
+            attn_mult = self.num_layer * self.num_head_q * n_steps
+
             config_cycles_iter = 0
             self._append_to_log(f"Image generation - Start qkv mapping")
             input_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='qkv', image_input=input_len)
+            # qkv: Q (input_len, dim, dim) + 2× KV (input_len, num_head_kv·head_dim, dim)
+            self._record_energy(M=input_len, N=self.dim, K=self.dim,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
+            self._record_energy(M=input_len, N=kv_proj_N, K=self.dim,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
+            self._record_energy(M=input_len, N=kv_proj_N, K=self.dim,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
             self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
             config_cycles_iter += input_cycles
 
             self._append_to_log(f"Image generation - Start attn")
             attn_single_cycles = self.run_sim_once_comp(kv_len=kv_len, is_gen_text=False, part='attn', image_input=input_len)
             attn_cycles = attn_single_cycles * self.num_head_q
+            # attn: 2 GEMMs per head, multiplied by num_head_q in cycle math
+            self._record_energy(M=input_len, N=kv_len, K=self.head_dim,
+                                precision=prec_comp0, multiplicity=attn_mult)
+            self._record_energy(M=input_len, N=self.head_dim, K=kv_len,
+                                precision=prec_comp0, multiplicity=attn_mult)
             self._append_to_log(f"Image generation - End attn, total cycles:{attn_cycles}")
             config_cycles_iter += attn_cycles
 
             self._append_to_log(f"Image generation - Start output mapping")
             output_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='omap', image_input=input_len)
+            self._record_energy(M=input_len, N=self.dim, K=self.dim,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
             self._append_to_log(f"Image generation - End output mapping, total cycles:{output_cycles}")
             config_cycles_iter += output_cycles
 
             self._append_to_log(f"Image generation - Start FFN up")
             ffn_up_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_up',which_ffn=config_name, image_input=input_len)
+            # ffn_up: layer_input depends on which_ffn mask, recorded twice (gate + up).
+            if config_name == "without_img":
+                layer_eff = input_len * (1 - self.text_only_sim)
+            elif config_name == "without_text":
+                layer_eff = input_len * (1 - self.image_only_sim)
+            else:
+                layer_eff = input_len
+            self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
+            self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
             self._append_to_log(f"Image generation - End FFN up, total cycles:{ffn_up_cycles}")
             config_cycles_iter += ffn_up_cycles
 
             self._append_to_log(f"Image generation - Start FFN down")
             ffn_down_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_down', image_input=input_len)
+            self._record_energy(M=input_len, N=self.dim, K=self.upshape,
+                                precision=prec_comp0, multiplicity=per_cfg_mult)
             self._append_to_log(f"Image generation - End FFN down, total cycles:{ffn_down_cycles}")
             config_cycles_iter += ffn_down_cycles
             
@@ -536,6 +684,11 @@ class Janus_sim():
         self._append_to_log("=" * 50)
         self._append_to_log(f"FINAL RESULT - Total Cycles: {self.total_cycles_all}, total seconds: {self.total_cycles_all/500000000}")
         self._append_to_log(f"Simulation Duration: {duration:.2f} seconds")
+
+        # Energy report (Phase F).
+        if self.energy_enabled and self.energy is not None:
+            self.energy.add_cycles(int(self.total_cycles_all))
+            self._append_to_log(self.energy.format_report())
         self._append_to_log("======= Bagel Model Simulation Completed =======")
         
         return self.total_cycles_all

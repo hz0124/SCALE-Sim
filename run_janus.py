@@ -21,18 +21,37 @@ def main():
     parser.add_argument('--config', type=str, default=None,
                         help='Optional: Path to a specific .json file, to config the hole simulation run')
 
+    parser.add_argument('--energy', action='store_true',
+                        help='Enable energy accounting in results.log (~1.5x runtime). '
+                             'Coefficients come from simulation_core/energy_accounting/coefficients.py '
+                             'and can be overridden in the workload JSON via "energy_coefficients" '
+                             'and "dram_type" fields.')
+
+    parser.add_argument('--validate', action='store_true',
+                        help='With --energy, also call accelergy CLI per sub-run to '
+                             'cross-validate the EnergyAccountant numbers. Slow.')
+
     args = parser.parse_args()
     print(f"Starting Bagel Simulation...")
     print(f"Hardware: {args.hw}")
     print(f"Task:     {args.task}")
     print(f"Config:    {args.config}")
-    
+    if args.energy:
+        print(f"Energy:   enabled" + ("  (+ accelergy validation)" if args.validate else ""))
+
     # 实例化Bagel仿真类
     janus = Janus_sim(hardware_type=args.hw, task=args.task)
-    
+
     # 读取JSON配置
     janus.read_from_json(cfg_path=args.config)
-    
+
+    if args.energy:
+        janus.energy_enabled = True
+    if janus.energy_enabled:
+        janus.setup_energy()
+        if args.validate:
+            janus.energy_validate = True
+
     # 运行完整模型仿真
     total_cycles = janus.run_model()
     
