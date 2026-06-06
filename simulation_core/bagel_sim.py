@@ -625,27 +625,66 @@ class Bagel_sim():
 
         total_image_cycles = 0
 
+        # Energy bookkeeping (Phase F): set up multiplicities once.
+        # Per-image-gen-step contributions:
+        #   prefetch / drain      : ×1
+        #   per-config blocks     : ×num_layer (inside the for loop, then config_cycles_iter * num_layer)
+        #   attn (per config)     : ×num_layer × num_head_q
+        # And the whole image_total then gets multiplied by gen_image_step at
+        # the end.  We pass that combined multiplicity into _record_energy.
+        n_kv_cfg = len(kv_configs)
+        n_steps = self.gen_image_step
+        # input/output/ffn_down are reused across every kv_config in the loop:
+        per_image_mult = self.num_layer * n_kv_cfg * n_steps
+
         self._append_to_log(f"Image generation - Start prefetching")
         prefetch_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='prefetch')
         self._append_to_log(f"Image generation - End prefetching, total cycles:{prefetch_cycles}")
+        # Prefetch is data movement, not compute; we don't model it for energy
+        # (it's a throughput estimate, not a real workload). Skip.
 
         self._append_to_log(f"Image generation - Start qkv mapping")
         input_cycles_text = self.run_sim_once(kv_length=0, is_gen_text=False, part='qkv', config=self.config_comm0)
+        # Real text-side QKV: 3 GEMMs (Q/K/V). M=text_attn, N=dim or num_head_kv*head_dim, K=dim.
+        kv_proj_N = self.num_head_kv * self.head_dim
+        self._record_energy(M=self.text_attn, N=self.dim, K=self.dim,
+                            precision=prec_comm0, multiplicity=per_image_mult)         # Q
+        self._record_energy(M=self.text_attn, N=kv_proj_N, K=self.dim,
+                            precision=prec_comm0, multiplicity=per_image_mult)         # K
+        self._record_energy(M=self.text_attn, N=kv_proj_N, K=self.dim,
+                            precision=prec_comm0, multiplicity=per_image_mult)         # V
+
         input_cycles_image = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='qkv')
+        # Image-side QKV from run_sim_once_comp: Q (vae_attn × dim × dim) + 2*KV
+        # (vae_attn × num_head_kv*head_dim × dim).
+        self._record_energy(M=self.vae_attn, N=self.dim, K=self.dim,
+                            precision=prec_comp0, multiplicity=per_image_mult)         # Q image
+        self._record_energy(M=self.vae_attn, N=kv_proj_N, K=self.dim,
+                            precision=prec_comp0, multiplicity=per_image_mult)         # K image
+        self._record_energy(M=self.vae_attn, N=kv_proj_N, K=self.dim,
+                            precision=prec_comp0, multiplicity=per_image_mult)         # V image
+
         input_cycles = input_cycles_text + input_cycles_image
         self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
 
         self._append_to_log(f"Image generation - Start output mapping")
         output_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='omap')
+        # Omap: M=image_input_len, N=dim, K=dim
+        self._record_energy(M=self.image_input_len, N=self.dim, K=self.dim,
+                            precision=prec_comp0, multiplicity=per_image_mult)
         self._append_to_log(f"Image generation - End output mapping, total cycles:{output_cycles}")
 
         self._append_to_log(f"Image generation - Start FFN down")
         ffn_down_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_down')
+        # FFN-down: M=image_input_len, N=dim, K=upshape
+        self._record_energy(M=self.image_input_len, N=self.dim, K=self.upshape,
+                            precision=prec_comp0, multiplicity=per_image_mult)
         self._append_to_log(f"Image generation - End FFN down, total cycles:{ffn_down_cycles}")
 
         self._append_to_log(f"Image generation - Start draining")
         drain_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='drain')
         self._append_to_log(f"Image generation - End draining, total cycles:{drain_cycles}")
+        # Drain is a throughput proxy; no energy model for it.
 
         total_image_cycles += prefetch_cycles
 
@@ -662,7 +701,34 @@ class Bagel_sim():
             config_cycles_iter += ffn_down_cycles
             config_cycles = config_cycles_iter * self.num_layer
             total_image_cycles += config_cycles
-            
+
+            # Energy: per-config attention + ffn_up.
+            #   attn: M=image_input_len, two GEMMs (kv_len, head_dim) and
+            #         (head_dim, kv_len). Per-config multiplicity =
+            #         num_layer × num_head_q × gen_image_step.
+            #   ffn_up: depends on which_ffn (image_only/text_only mask).
+            attn_mult = self.num_layer * self.num_head_q * n_steps
+            self._record_energy(M=self.image_input_len, N=kv_len, K=self.head_dim,
+                                precision=prec_comp0, multiplicity=attn_mult)
+            self._record_energy(M=self.image_input_len, N=self.head_dim, K=kv_len,
+                                precision=prec_comp0, multiplicity=attn_mult)
+
+            # FFN-up has variable layer_input (which_ffn dampens it via
+            # image_only_sim / text_only_sim). We mirror the cycle calc.
+            if config_name == "without_img":
+                layer_eff = self.image_input_len * (1 - self.text_only_sim)
+            elif config_name == "without_text":
+                layer_eff = self.image_input_len * (1 - self.image_only_sim)
+            else:
+                layer_eff = self.image_input_len
+            ffn_up_mult = self.num_layer * n_steps  # per-config, no num_head
+            self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
+                                precision=prec_comp0, multiplicity=ffn_up_mult)
+            # ARGUS multiplies ffn_up_cycles by 2 in the cycle calc (gate +
+            # up projections), so we record ffn_up's energy twice.
+            self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
+                                precision=prec_comp0, multiplicity=ffn_up_mult)
+
             self._append_to_log(f"Image generation - {config_name} config completed, cycles: {config_cycles}")
 
         total_image_cycles += drain_cycles
