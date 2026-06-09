@@ -75,17 +75,21 @@ def from_scalesim_reports(detail_csv_path, scale=1.0, layer_id=0):
 
 def from_geometric_estimate(M, N, K, arr_h, arr_w, *, dataflow="os"):
     """
-    Closed-form access-count estimate for one GEMM (M × N) × (N × K) → (M × K)
+    Closed-form access-count estimate for one GEMM (M × K) · (K × N) → (M × N)
     on an arr_h × arr_w systolic array. Assumes:
 
-      - DRAM is read once per tensor (ifmap M×N, filter N×K, ofmap M×K),
+      - DRAM is read once per tensor (ifmap M×K, filter K×N, ofmap M×N),
         i.e. SRAM is sized to hold each operand. Real SCALE-Sim allows
         re-fetching when the SRAM is smaller; we ignore that here for
         simplicity (worst case ±2x for tight budgets, ±0% for generous).
+        For M=1 token-by-token decode there is no weight reuse to spill, so
+        this closed form is essentially exact for DRAM — unlike the tiled
+        SCALE-Sim report, whose DRAM counts are dominated by fixed-size
+        prefetch-buffer fills on the sub-array tile (see DEVLOG #4).
       - SRAM reads scale with MAC ops divided by the array dimension along
         which an operand is reused (rows for filter, cols for ifmap in OS;
         same total either way for this simple model).
-      - SRAM ofmap writes scale with output element count M×K.
+      - SRAM ofmap writes scale with output element count M×N.
 
     The `dataflow` arg is accepted for symmetry with future variations but
     currently doesn't change the formulas (the totals are dataflow-agnostic
@@ -106,10 +110,13 @@ def from_geometric_estimate(M, N, K, arr_h, arr_w, *, dataflow="os"):
     arr_h = max(1, int(arr_h))
     arr_w = max(1, int(arr_w))
 
-    # DRAM: one fetch per tensor (no spill).
-    dram_ifmap  = M * N
+    # DRAM: one fetch per tensor (no spill). Operand roles for a GEMM
+    # (M×K)·(K×N)→(M×N): ifmap = M×K (input), filter = K×N (weights),
+    # ofmap = M×N (output). Verified against SCALE-Sim's DETAILED_ACCESS_REPORT
+    # (M=1,N=64,K=3584: SRAM IFMAP Reads=3584=M·K, DRAM OFMAP Writes=64=M·N).
+    dram_ifmap  = M * K
     dram_filter = N * K
-    dram_ofmap  = M * K
+    dram_ofmap  = M * N
 
     # SRAM: each ifmap element is read once per output column it contributes
     # to, i.e. K times conceptually but we model it at fold granularity:
@@ -120,9 +127,9 @@ def from_geometric_estimate(M, N, K, arr_h, arr_w, *, dataflow="os"):
     sram_ifmap  = row_fold * col_fold * arr_h * N
     sram_filter = row_fold * col_fold * arr_w * N
 
-    # OFMAP writes: roughly M × K (one write per output element). SCALE-Sim
-    # adds a small skew tail of arr_h+arr_w-2 per fold; we ignore it.
-    sram_ofmap = M * K
+    # OFMAP writes: one write per output element = M × N. SCALE-Sim adds a
+    # small skew tail of arr_h+arr_w-2 per fold; we ignore it.
+    sram_ofmap = M * N
 
     return {
         "sram_ifmap_reads":  sram_ifmap,
