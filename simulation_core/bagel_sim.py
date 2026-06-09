@@ -67,7 +67,6 @@ class Bagel_sim():
         self.energy = None              # set in setup_energy()
         self.dram_type = None           # JSON "dram_type", default in coefficients.py
         self.coef_overrides = None      # JSON "energy_coefficients"
-        self._last_run_detail_csv = None  # set by run_sim_once
         self.energy_validate = False    # set by --validate; runs accelergy CLI
                                         # cross-check on top-N sub-runs at end
 
@@ -92,15 +91,17 @@ class Bagel_sim():
 
 
     def _record_energy(self, M, N, K, precision="fp16", scale=1.0,
-                       multiplicity=1, label=None, hw_cfg_path=None,
-                       detail_csv=None, prefer_csv=False):
+                       multiplicity=1, label=None, hw_cfg_path=None):
         """
         Add one sub-run's MAC + SRAM + DRAM access to self.energy.
 
+        Access counts come from the closed-form geometric estimate. (Sourcing
+        them from the tiled SCALE-Sim DETAILED_ACCESS_REPORT was tried and
+        removed: its DRAM counts are dominated by fixed-size prefetch-buffer
+        fills on the sub-array tile, not real traffic — see DEVLOG #4.)
+
         Args:
-            M, N, K:    real GEMM dims (post-scaling, i.e. the dim/tile blowup
-                        is already factored in via 'scale' or by the caller
-                        passing the real N directly).
+            M, N, K:    real GEMM dims (M×K · K×N → M×N), post dim/tile blowup.
             precision:  fp16 / int8 / int4
             scale:      multiplier applied to access counts (used when M, N,
                         K describe the per-tile sub-run and the caller wants
@@ -116,23 +117,12 @@ class Bagel_sim():
             hw_cfg_path: SCALE-Sim cfg path for this sub-run (e.g.
                         'configs/bagel/ours_int4.cfg'). Needed by F7
                         validate to spawn accelergy with matching hw.
-            detail_csv: path to a SCALE-Sim DETAILED_ACCESS_REPORT.csv. When
-                        prefer_csv=True, access counts come from there;
-                        otherwise from geometry. Defaults to
-                        self._last_run_detail_csv.
-            prefer_csv: True when the run came from real SCALE-Sim and we
-                        want SCALE-Sim's bookkeeping over our geometry.
         """
         if not self.energy_enabled or self.energy is None:
             return
         if multiplicity <= 0:
             return
-        from simulation_core.energy_accounting.extractors import (
-            from_geometric_estimate, from_scalesim_reports
-        )
-
-        if detail_csv is None:
-            detail_csv = self._last_run_detail_csv
+        from simulation_core.energy_accounting.extractors import from_geometric_estimate
 
         # Combined factor: per-sub-run scale × outer multiplicity.
         total_factor = float(scale) * float(multiplicity)
@@ -145,14 +135,10 @@ class Bagel_sim():
         # SCALE-Sim CSV PE-level Read Count, which is biased by col_fold).
         self.energy.add_mac_ops(int(M * N * K * total_factor), precision=precision)
 
-        # Pick the access-count source for SRAM/DRAM.
-        if prefer_csv and detail_csv is not None and os.path.exists(detail_csv):
-            counts = from_scalesim_reports(detail_csv, scale=total_factor)
-        else:
-            counts = from_geometric_estimate(
-                M, N, K, self.array_height or 32, self.array_width or 32
-            )
-            counts = {k: int(v * total_factor) for k, v in counts.items()}
+        counts = from_geometric_estimate(
+            M, N, K, self.array_height or 32, self.array_width or 32
+        )
+        counts = {k: int(v * total_factor) for k, v in counts.items()}
 
         # Translate precision to bytes-per-element.
         word_bytes = {"fp16": 2.0, "int8": 1.0, "int4": 0.5}.get(precision, 2.0)
@@ -364,21 +350,6 @@ class Bagel_sim():
         )
 
         results = s.run_scale(top_path=self.log_path)
-
-        # Energy accounting hook: stash the SCALE-Sim run-name dir so
-        # _record_energy can read DETAILED_ACCESS_REPORT.csv. The run name
-        # comes from cfg's [general] run_name section, which scalesim parsed
-        # into s.config.
-        self._last_run_detail_csv = None
-        if self.energy_enabled:
-            try:
-                run_name = s.config.get_run_name()
-                self._last_run_detail_csv = os.path.join(
-                    self.log_path, run_name, "DETAILED_ACCESS_REPORT.csv"
-                )
-            except Exception:
-                # Don't let energy bookkeeping break the simulation.
-                self._last_run_detail_csv = None
 
         # 解包结果，获取总周期数
         if isinstance(results, (tuple, list)) and len(results) >= 1:

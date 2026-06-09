@@ -67,7 +67,6 @@ class Janus_sim():
         self.energy = None
         self.dram_type = None
         self.coef_overrides = None
-        self._last_run_detail_csv = None
         self.energy_validate = False    # set by --validate
 
 
@@ -87,33 +86,27 @@ class Janus_sim():
 
 
     def _record_energy(self, M, N, K, precision="fp16", scale=1.0,
-                       multiplicity=1, label=None, hw_cfg_path=None,
-                       detail_csv=None, prefer_csv=False):
+                       multiplicity=1, label=None, hw_cfg_path=None):
         """Add one sub-run's MAC + SRAM + DRAM access to self.energy.
         See Bagel_sim._record_energy for full docstring; identical semantics.
+        Access counts come from the closed-form geometric estimate (the tiled
+        SCALE-Sim report path was removed — its DRAM counts are prefetch-buffer
+        artifacts, see DEVLOG #4).
         """
         if not self.energy_enabled or self.energy is None:
             return
         if multiplicity <= 0:
             return
-        from simulation_core.energy_accounting.extractors import (
-            from_geometric_estimate, from_scalesim_reports
-        )
-
-        if detail_csv is None:
-            detail_csv = self._last_run_detail_csv
+        from simulation_core.energy_accounting.extractors import from_geometric_estimate
 
         total_factor = float(scale) * float(multiplicity)
         before_pJ = self.energy.total_pJ() if (label or hw_cfg_path) else 0.0
         self.energy.add_mac_ops(int(M * N * K * total_factor), precision=precision)
 
-        if prefer_csv and detail_csv is not None and os.path.exists(detail_csv):
-            counts = from_scalesim_reports(detail_csv, scale=total_factor)
-        else:
-            counts = from_geometric_estimate(
-                M, N, K, self.array_height or 32, self.array_width or 32
-            )
-            counts = {k: int(v * total_factor) for k, v in counts.items()}
+        counts = from_geometric_estimate(
+            M, N, K, self.array_height or 32, self.array_width or 32
+        )
+        counts = {k: int(v * total_factor) for k, v in counts.items()}
 
         word_bytes = {"fp16": 2.0, "int8": 1.0, "int4": 0.5}.get(precision, 2.0)
 
@@ -320,17 +313,6 @@ class Janus_sim():
         )
 
         results = s.run_scale(top_path=self.log_path)
-
-        # Energy accounting hook (Phase F): stash detail csv for prefer_csv mode.
-        self._last_run_detail_csv = None
-        if self.energy_enabled:
-            try:
-                run_name = s.config.get_run_name()
-                self._last_run_detail_csv = os.path.join(
-                    self.log_path, run_name, "DETAILED_ACCESS_REPORT.csv"
-                )
-            except Exception:
-                self._last_run_detail_csv = None
 
         # 解包结果，获取总周期数
         if isinstance(results, (tuple, list)) and len(results) >= 1:

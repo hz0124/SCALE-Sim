@@ -1,76 +1,30 @@
 """
-Access-count extractors for the energy accountant.
-
-Two modes, matching the two ARGUS sub-run paths:
-
-    from_scalesim_reports(detail_csv, scale=1.0, layer_id=0)
-        Parse SCALE-Sim's DETAILED_ACCESS_REPORT.csv. ARGUS calls
-        run_sim_once with a "tile" GEMM (one row mapped to a small N=tile),
-        then linearly scales the result by `dim/tile` outside. We accept a
-        `scale` multiplier so the same scale applies to the access counts.
-        Returns counts in element-count (words) so the caller can multiply by
-        the per-precision word_bytes.
+Access-count extractor for the energy accountant.
 
     from_geometric_estimate(M, N, K, arr_h, arr_w, *, dataflow='os')
-        Closed-form estimate. No SCALE-Sim invocation. Used by ARGUS's
-        run_sim_once_comp path, which itself is purely analytical.
+        Closed-form estimate of SRAM/DRAM access counts for one GEMM. No
+        SCALE-Sim invocation. This is the single source of access counts for
+        EnergyAccountant.
 
-Both return the same flat dict (SRAM/DRAM access counts only — MAC ops are
-*not* derivable cleanly from the SCALE-Sim CSV alone, since the *_Read Counts
-columns track PE-level reads which are mac_ops × col_fold in OS dataflow.
-The caller knows (M, N, K) from build_topologies, so it should call
-EnergyAccountant.add_mac_ops(M * N * K, precision) directly):
+A second extractor (from_scalesim_reports) once parsed SCALE-Sim's
+DETAILED_ACCESS_REPORT.csv directly, but it was removed: ARGUS runs each
+sub-run as a small N=tile GEMM, and on tiles smaller than the SRAM the
+report's DRAM counts are dominated by fixed-size prefetch-buffer fills
+(DRAM IFMAP Reads stayed ~32768 regardless of M/N/K) rather than real
+traffic — see DEVLOG #4. For M=1 token-by-token decode the closed form has
+no weight reuse to spill, so it is essentially exact for DRAM.
+
+Returns a flat dict (SRAM/DRAM access counts only — MAC ops are tracked
+separately via EnergyAccountant.add_mac_ops(M * N * K, precision)):
 
     {
-        "sram_ifmap_reads":      int,
-        "sram_filter_reads":     int,
-        "sram_ofmap_writes":     int,
-        "dram_ifmap_reads":      int,
-        "dram_filter_reads":     int,
-        "dram_ofmap_writes":     int,
+        "sram_ifmap_reads":  int, "sram_filter_reads":  int,
+        "sram_ofmap_writes": int, "dram_ifmap_reads":   int,
+        "dram_filter_reads": int, "dram_ofmap_writes":  int,
     }
-
-Calibration (sanity check vs SCALE-Sim, 64×64×64 GEMM on 32×32 OS array):
-    SCALE-Sim:   ifmap=4096   filter=4096   ofmap=4096   sram_ifmap=8192
-    Geometric:   ifmap=4096   filter=4096   ofmap=4096   sram_ifmap=8192
-    → matches exactly for this tile-aligned case.
 """
 
 import math
-import pandas as pd
-
-
-# Column names in DETAILED_ACCESS_REPORT.csv. We read by header (not index)
-# so the order can shift without breaking us. Whitespace-insensitive.
-_DETAIL_COLS = {
-    "sram_ifmap_reads":  "SRAM IFMAP Reads",
-    "sram_filter_reads": "SRAM Filter Reads",
-    "sram_ofmap_writes": "SRAM OFMAP Writes",
-    "dram_ifmap_reads":  "DRAM IFMAP Reads",
-    "dram_filter_reads": "DRAM Filter Reads",
-    "dram_ofmap_writes": "DRAM OFMAP Writes",
-}
-
-
-def from_scalesim_reports(detail_csv_path, scale=1.0, layer_id=0):
-    """
-    Parse a SCALE-Sim DETAILED_ACCESS_REPORT.csv and return access counts
-    (in elements/words, multiplied by `scale` for the ARGUS dim/tile blowup).
-    """
-    df = pd.read_csv(
-        detail_csv_path,
-        sep=r"\s*,\s*",
-        engine="python",
-        skipinitialspace=True,
-    )
-    # pandas may keep trailing whitespace in column names; strip them.
-    df.columns = [c.strip() for c in df.columns]
-    row = df.iloc[layer_id]
-
-    return {
-        key: int(int(row[col]) * scale)
-        for key, col in _DETAIL_COLS.items()
-    }
 
 
 def from_geometric_estimate(M, N, K, arr_h, arr_w, *, dataflow="os"):
