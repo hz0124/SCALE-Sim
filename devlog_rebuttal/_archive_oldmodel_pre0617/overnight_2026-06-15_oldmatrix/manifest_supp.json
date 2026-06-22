@@ -1,0 +1,37 @@
+[
+ [
+  "bagel",
+  "ours",
+  "GenEdit",
+  "bagel_ours_GenEdit_allonpure",
+  "allon_pure"
+ ],
+ [
+  "bagel",
+  "ours",
+  "GenEval",
+  "bagel_ours_GenEval_allonpure",
+  "allon_pure"
+ ],
+ [
+  "bagel",
+  "ours",
+  "MM",
+  "bagel_ours_MM_allonpure",
+  "allon_pure"
+ ],
+ [
+  "janus",
+  "ours",
+  "GenEval",
+  "janus_ours_GenEval_allonpure",
+  "allon_pure"
+ ],
+ [
+  "janus",
+  "ours",
+  "MM",
+  "janus_ours_MM_allonpure",
+  "allon_pure"
+ ]
+]

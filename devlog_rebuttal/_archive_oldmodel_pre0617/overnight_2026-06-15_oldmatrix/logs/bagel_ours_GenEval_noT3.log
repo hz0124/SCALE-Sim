@@ -1,0 +1,76 @@
+[10:12:11] ======= Bagel Model Simulation Started =======
+[10:12:11] Configuration: text_len=229, image_steps=50, layers=28, batch_size=1
+[10:12:11] =========== Text Generation Started (total steps: 229) ===========
+[10:12:11] Text generation - Start qkv mapping
+[10:12:17] Text generation - End qkv mapping, total cycles:2141784.0
+[10:12:17] Text generation - Start output mapping
+[10:12:23] Text generation - End output mapping, total cycles:1665832.0
+[10:12:23] Text generation - Start FFN up
+[10:12:28] Text generation - End FFN up, total cycles:17610224.0
+[10:12:28] Text generation - Start FFN down
+[10:12:58] Text generation - End FFN down, total cycles:8547112.0
+[10:12:58] Text generation - Step 0 to Step 19 started (kv_len in averagr: 58)
+[10:12:58] Text generation - Step 20 to Step 39 started (kv_len in averagr: 98)
+[10:12:58] Text generation - Step 40 to Step 59 started (kv_len in averagr: 138)
+[10:12:59] Text generation - Step 60 to Step 79 started (kv_len in averagr: 178)
+[10:13:00] Text generation - Step 80 to Step 99 started (kv_len in averagr: 218)
+[10:13:00] Text generation - Step 100 to Step 119 started (kv_len in averagr: 258)
+[10:13:01] Text generation - Step 120 to Step 139 started (kv_len in averagr: 298)
+[10:13:02] Text generation - Step 140 to Step 159 started (kv_len in averagr: 338)
+[10:13:03] Text generation - Step 160 to Step 179 started (kv_len in averagr: 378)
+[10:13:04] Text generation - Step 180 to Step 199 started (kv_len in averagr: 418)
+[10:13:05] Text generation - Step 200 to Step 219 started (kv_len in averagr: 458)
+[10:13:06] Text generation - Step 220 to Step 228 started (kv_len in averagr: 493)
+[10:13:07] =========== Text Generation Completed, total cycles: 194198545726.5, total seconds: 388.397091453 ===========
+[10:13:07] =========== Image Generation Started (total steps: 50) ===========
+[10:13:07] Image generation - Start prefetching
+[10:13:07] Image generation - End prefetching, total cycles:2048.0
+[10:13:07] Image generation - Start qkv mapping
+[10:13:18] Text generation - End qkv mapping, total cycles:24718392.0
+[10:13:18] Image generation - Start output mapping
+[10:13:18] Image generation - End output mapping, total cycles:17967488
+[10:13:18] Image generation - Start FFN down
+[10:13:18] Image generation - End FFN down, total cycles:94971008
+[10:13:18] Image generation - Start draining
+[10:13:18] Image generation - End draining, total cycles:512.0
+[10:13:18] Image generation - full_cache config started (kv_len: 827)
+[10:13:18] Image generation - full_cache config completed, cycles: 9465847328.0
+[10:13:18] Image generation - without_text config started (kv_len: 803)
+[10:13:18] Image generation - without_text config completed, cycles: 7407708448.0
+[10:13:18] =========== Image Generation Completed, total cycles: 843677916800.0, total seconds: 1687.3558336 ===========
+[10:13:18] ==================================================
+[10:13:18] FINAL RESULT - Total Cycles: 1037876462526.5, total seconds: 2075.752925053
+[10:13:18] Simulation Duration: 67.35 seconds
+[10:13:18] CYCLE BREAKDOWN (per-operator cycles / % of end-to-end):
+  [text] subtotal: 194,198,545,726  ( 18.7%)
+      OPBREAKDOWN text/attn 2063273502 0.199
+      OPBREAKDOWN text/ffn_down 54804082144 5.280
+      OPBREAKDOWN text/ffn_up 112916756288 10.880
+      OPBREAKDOWN text/omap 10681314784 1.029
+      OPBREAKDOWN text/qkv 13733119008 1.323
+  [img] subtotal: 843,677,916,800  ( 81.3%)
+      OPBREAKDOWN img/attn 29142220800 2.808
+      OPBREAKDOWN img/drain 25600 0.000
+      OPBREAKDOWN img/ffn_down 265918822400 25.621
+      OPBREAKDOWN img/ffn_up 429096281600 41.344
+      OPBREAKDOWN img/omap 50308966400 4.847
+      OPBREAKDOWN img/prefetch 102400 0.000
+      OPBREAKDOWN img/qkv 69211497600 6.669
+  breakdown sum: 1,037,876,462,526  (total_cycles=1,037,876,462,526)
+[10:13:18] ENERGY BREAKDOWN:
+  Compute (MAC):  1229435.346 mJ  ( 74.5%)
+  SRAM total:      41835.983 mJ  (  2.5%)
+    ifmap:         13857.001 mJ
+    filter:        27714.001 mJ
+    ofmap:           264.982 mJ
+  DRAM total:     378516.381 mJ  ( 22.9%)  [type=HBM2]
+    ifmap:         15772.032 mJ
+    filter:       138634.202 mJ
+    ofmap:         16534.854 mJ
+    idle:         207575.293 mJ
+  ----
+  Total Energy: 1649787.710 mJ
+  Avg Power:         0.795 W   (cycles 1,037,876,462,526)
+  EDP:          3424551665.189 mJ·s
+  Total MAC ops: 819,623,564,103,680   [fp16=819,623,564,103,680]
+[10:13:18] ======= Bagel Model Simulation Completed =======
