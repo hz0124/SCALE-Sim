@@ -1,4 +1,2 @@
 Layer,M,N,K,
-Qmap_text,2,3584,3584,
-Kmap_text,2,512,3584,
-Vmap_text,2,512,3584,
+Kmap_text,2,64,3584,

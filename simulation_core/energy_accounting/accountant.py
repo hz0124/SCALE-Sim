@@ -53,11 +53,21 @@ class EnergyAccountant:
         # Raw counts. We delay the multiply-by-pJ until report time so that
         # tweaking coefficients post-hoc doesn't require re-simulation.
         self.mac_ops_per_precision = defaultdict(int)
+        # Per-operator (stage/optype) MAC + off-chip DRAM bytes, for the detailed
+        # utilization breakdown (paper Fig.14 style). Keyed e.g. "text/attn",
+        # "img/ffn". Populated by Bagel_sim._record_energy; purely additive.
+        self.op_mac = defaultdict(float)
+        self.op_dram_bytes = defaultdict(float)
         self.sram_words = defaultdict(int)         # key: ("ifmap","read") etc.
         self.sram_byte_words = defaultdict(int)    # bytes accumulated
         self.dram_words = defaultdict(int)
         self.dram_byte_words = defaultdict(int)
         self.cycles_total = 0
+
+        # Extra static/leakage energy added externally (need-9 disagg idle
+        # leakage). Stays 0 for every existing hardware -> no effect on their
+        # totals. Bagel_sim.run_model calls add_static_energy() for disagg only.
+        self.static_extra_pJ = 0.0
 
         # Per-sub-run audit trail (Phase F7). Each entry summarizes one
         # _record_energy call from Bagel_sim/Janus_sim:
@@ -107,6 +117,38 @@ class EnergyAccountant:
         """Add cycles to the running total. Used for idle-DRAM background."""
         if n > 0:
             self.cycles_total += int(n)
+
+    def add_op_breakdown(self, op_tag, mac, dram_bytes):
+        """Accumulate per-operator MAC ops + off-chip DRAM bytes (detailed
+        utilization breakdown). op_tag e.g. 'text/attn', 'img/ffn'. No-op if
+        op_tag is falsy. Does not touch any energy total."""
+        if op_tag:
+            self.op_mac[op_tag] += float(mac)
+            self.op_dram_bytes[op_tag] += float(dram_bytes)
+
+    def snapshot(self):
+        """
+        Return the current cumulative MAC count and DRAM bytes (read+write).
+
+        Read-only; does not mutate any state. Bagel_sim.run_model calls this
+        at the text->image stage boundary and diffs two snapshots to attribute
+        MAC ops / DRAM traffic to each stage for the per-stage utilization
+        metrics (need-9 disagg 4-way util table). Only the running tallies are
+        read, so calling it has zero effect on energy totals.
+        """
+        return {
+            "mac": sum(self.mac_ops_per_precision.values()),
+            "dram_bytes": sum(self.dram_byte_words.values()),
+        }
+
+    def add_static_energy(self, pJ):
+        """
+        Add externally-computed static/leakage energy (pJ). Used only by the
+        need-9 disaggregated baseline to charge idle half-chip leakage; left
+        at 0 for every other hardware so their totals are unchanged.
+        """
+        if pJ > 0:
+            self.static_extra_pJ += float(pJ)
 
     def record_subrun(self, label, M, N, K, precision, multiplicity, scale,
                       hw_cfg_path, subtotal_pJ):
@@ -171,6 +213,17 @@ class EnergyAccountant:
         # mW × s = mJ. Convert to pJ: ×1e9.
         return self.coef["dram_idle_mw"] * seconds * 1e9
 
+    def compute_array_static_pJ(self):
+        """Compute-array static (leakage + clock-tree) power × wall-time, for
+        EVERY hardware. array_static_mw is the full physical lane budget's
+        static power; a slower design pays more (it holds the array longer).
+        Removes the dynamic-only bias that under-charged slow accelerators.
+        0 disables (pure dynamic-energy study)."""
+        if self.cycles_total <= 0:
+            return 0.0
+        seconds = self.cycles_total / self.coef["freq_hz"]
+        return self.coef.get("array_static_mw", 0.0) * seconds * 1e9
+
     # --------------------------------------------------------------- totals
 
     def total_compute_pJ(self):
@@ -183,7 +236,9 @@ class EnergyAccountant:
         return sum(self.compute_dram_pJ().values()) + self.compute_dram_idle_pJ()
 
     def total_pJ(self):
-        return self.total_compute_pJ() + self.total_sram_pJ() + self.total_dram_pJ()
+        return (self.total_compute_pJ() + self.total_sram_pJ()
+                + self.total_dram_pJ() + self.compute_array_static_pJ()
+                + self.static_extra_pJ)
 
     def total_seconds(self):
         if self.cycles_total <= 0:
@@ -221,6 +276,7 @@ class EnergyAccountant:
             "dram_filter_pJ": dram["filter"],
             "dram_ofmap_pJ": dram["ofmap"],
             "dram_idle_pJ": self.compute_dram_idle_pJ(),
+            "array_static_pJ": self.compute_array_static_pJ() + self.static_extra_pJ,
             "total_pJ": self.total_pJ(),
             "total_mJ": self.total_pJ() * 1e-9,
             "cycles_total": self.cycles_total,
@@ -275,6 +331,13 @@ class EnergyAccountant:
         lines.append(f"    filter:       {fmt(b['dram_filter_pJ'])}")
         lines.append(f"    ofmap:        {fmt(b['dram_ofmap_pJ'])}")
         lines.append(f"    idle:         {fmt(b['dram_idle_pJ'])}")
+        # Compute-array static (leakage + clock) × wall-time, charged for every
+        # hardware (slower designs pay more). 0 and hidden if array_static_mw=0.
+        if b.get("array_static_pJ", 0.0) > 0:
+            lines.append(
+                f"  Array static (leakage+clock): {fmt(b['array_static_pJ'])}"
+                f"  ({pct(b['array_static_pJ']):5.1f}%)"
+            )
         lines.append(f"  ----")
         lines.append(f"  Total Energy: {fmt(b['total_pJ'])}")
         lines.append(
@@ -283,5 +346,13 @@ class EnergyAccountant:
         lines.append(
             f"  EDP:          {b['edp_pJs'] * 1e-9:>10.3f} mJ·s"
         )
+        # MAC op counts per precision + total — used by the utilization
+        # metric (req 8): util = total_MAC / (PE_total × cycles).
+        total_mac = sum(self.mac_ops_per_precision.values())
+        per_prec = " ".join(
+            f"{p}={self.mac_ops_per_precision[p]:,d}"
+            for p in sorted(self.mac_ops_per_precision)
+        )
+        lines.append(f"  Total MAC ops: {total_mac:,d}   [{per_prec}]")
 
         return "\n".join(lines)

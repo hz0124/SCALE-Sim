@@ -27,6 +27,9 @@ class Janus_sim():
         self.config_comp1 = os.path.join(PROJECT_ROOT, "configs", "scale.cfg")
         self.config_comm0 = os.path.join(PROJECT_ROOT, "configs", "scale.cfg")
         self.config_comm1 = os.path.join(PROJECT_ROOT, "configs", "scale.cfg")
+        # Text-stage FFN slot (see Bagel_sim): ARGUS points it at the
+        # weight-INT8-storage cfg; other hardware reuses its projection cfg.
+        self.config_ffn_text = os.path.join(PROJECT_ROOT, "configs", "scale.cfg")
         self.log_path = os.path.join(PROJECT_ROOT, "results")
         self.result_path = os.path.join(PROJECT_ROOT, "results", "bagel")
         self.num_layer = 24
@@ -41,6 +44,8 @@ class Janus_sim():
         self.upshape = 5632
         self.tile = 64
         self.total_cycles_all = 0
+        # Per-operator cycle breakdown (req 3); see Bagel_sim.
+        self.cycle_breakdown = {}
         self.sample_rate = 10
         self.ifmapbufsz = 0
         self.filterbufsz = 0
@@ -52,6 +57,20 @@ class Janus_sim():
         self.array_height = 0
         self.array_width = 0
         self.array_width_half = 0
+        self.array_width_fp = 0
+        self.array_width_ffn = 0
+        self.array_width_proj = 0
+        # Peak off-chip DRAM bandwidth (GB/s) for the analytical memory-bound
+        # text model (mirrors Bagel_sim). Default = aligned 32 GB/s.
+        self.peak_dram_gbps = 32.0
+        self.quant_proj = False
+        # ARGUS technique switches (REBUTTAL_FRAMEWORK.md §4.5); mirrors
+        # Bagel_sim. t2_hard is a placeholder (SAU overhead unmodelled).
+        self.t1_soft = True
+        self.t1_hard = True
+        self.t2_soft = True
+        self.t2_hard = True
+        self.t3_soft = True
         self.sparsity_kv = 0.5
         self.sparsity_cross_attn = 1
         self.low_precise_self_attn = 0
@@ -86,12 +105,14 @@ class Janus_sim():
 
 
     def _record_energy(self, M, N, K, precision="fp16", scale=1.0,
-                       multiplicity=1, label=None, hw_cfg_path=None):
+                       multiplicity=1, label=None, hw_cfg_path=None,
+                       weight_precision=None, mac_split=None):
         """Add one sub-run's MAC + SRAM + DRAM access to self.energy.
-        See Bagel_sim._record_energy for full docstring; identical semantics.
-        Access counts come from the closed-form geometric estimate (the tiled
-        SCALE-Sim report path was removed — its DRAM counts are prefetch-buffer
-        artifacts, see DEVLOG #4).
+        See Bagel_sim._record_energy for full docstring; identical semantics
+        (incl. weight_precision for storage-only low precision and mac_split
+        for splitting/forcing MAC precision). Access counts come from the
+        closed-form geometric estimate (the tiled SCALE-Sim report path was
+        removed — its DRAM counts are prefetch-buffer artifacts, see DEVLOG #4).
         """
         if not self.energy_enabled or self.energy is None:
             return
@@ -101,16 +122,24 @@ class Janus_sim():
 
         total_factor = float(scale) * float(multiplicity)
         before_pJ = self.energy.total_pJ() if (label or hw_cfg_path) else 0.0
-        self.energy.add_mac_ops(int(M * N * K * total_factor), precision=precision)
+        total_macs = int(M * N * K * total_factor)
+        if mac_split:
+            for mac_prec, frac in mac_split.items():
+                self.energy.add_mac_ops(int(total_macs * frac), precision=mac_prec)
+        else:
+            self.energy.add_mac_ops(total_macs, precision=precision)
 
         counts = from_geometric_estimate(
             M, N, K, self.array_height or 32, self.array_width or 32
         )
         counts = {k: int(v * total_factor) for k, v in counts.items()}
 
-        word_bytes = {"fp16": 2.0, "int8": 1.0, "int4": 0.5}.get(precision, 2.0)
+        _bytes = {"fp16": 2.0, "int8": 1.0, "int4": 0.5}
+        act_bytes = _bytes.get(precision, 2.0)
+        w_bytes = _bytes.get(weight_precision, act_bytes) if weight_precision else act_bytes
 
         for kind in ("ifmap", "filter", "ofmap"):
+            word_bytes = w_bytes if kind == "filter" else act_bytes
             if kind == "ofmap":
                 self.energy.add_sram_access(
                     kind, words=counts["sram_ofmap_writes"],
@@ -154,23 +183,54 @@ class Janus_sim():
         self.kv_cache_init = cfg.get("kv_cache_init")
         self.gen_text_len = cfg.get("gen_text_len")
         self.gen_image_step = cfg.get("gen_image_step")
-        
+
+        # ARGUS technique switches (REBUTTAL_FRAMEWORK.md §4.5). Read before
+        # the cfg-slot dispatch because t3_soft decides the FFN slot.
+        self.t1_soft = bool(cfg.get("t1_soft", True))
+        self.t1_hard = bool(cfg.get("t1_hard", True))
+        self.t2_soft = bool(cfg.get("t2_soft", True))
+        self.t2_hard = bool(cfg.get("t2_hard", True))
+        self.t3_soft = bool(cfg.get("t3_soft", True))
+        # ARGUS projection-quantization extension (framework §15), default off.
+        # See Bagel_sim. Only affects ours.
+        self.quant_proj = bool(cfg.get("quant_proj", False))
+
         if self.hardware_type == 'base' or self.hardware_type == 'flightvgm' or self.hardware_type == 'sdma':
+            self.config_comp0 = cfg.get("config", self.config_comp0)
             self.config_comp1 = cfg.get("config", self.config_comp1)
-            self.config_comp2 = cfg.get("config", self.config_comp2)
             self.config_comm0 = cfg.get("config", self.config_comm0)
             self.config_comm1 = cfg.get("config", self.config_comm1)
+            self.config_ffn_text = cfg.get("config", self.config_ffn_text)
         elif self.hardware_type == 'ours':
+            # No FP-INT8 compute unit: text stage all on the FP-FP array,
+            # INT8 is a storage format for FFN weights only (see Bagel_sim).
             self.config_comp0 = cfg.get("config_fp16", self.config_comp0)
             self.config_comp1 = cfg.get("config_int4", self.config_comp1)
-            self.config_comm0 = cfg.get("config_int8", self.config_comm0)
-            self.config_comm1 = cfg.get("config_int8", self.config_comm1)
-        elif self.hardware_type == 'figna':
+            self.config_comm0 = cfg.get("config_fp16", self.config_comm0)
+            self.config_comm1 = cfg.get("config_fp16", self.config_comm1)
+            if self.quant_proj:
+                self.config_comm0 = cfg.get(
+                    "config_proj_int4", cfg.get("config_int4", self.config_comm0))
+            if self.t3_soft:
+                if self.task == 'MM':
+                    # MM is pure-text decode: there is no diffusion stage to keep
+                    # the FP-INT4 array busy, so the AR-stage FFN runs on it at
+                    # W4A16 (INT4 weights), matching figna — instead of the
+                    # INT8-storage FP-FP path used when an image stage follows.
+                    self.config_ffn_text = cfg.get(
+                        "config_int4", cfg.get("config_ffn_text", self.config_ffn_text))
+                else:
+                    self.config_ffn_text = cfg.get(
+                        "config_ffn_text", cfg.get("config_fp16", self.config_ffn_text))
+            else:
+                self.config_ffn_text = cfg.get("config_fp16", self.config_ffn_text)
+        elif self.hardware_type in ('figna', 'axcore'):
             self.config_comp0 = cfg.get("config_fp16", self.config_comp0)
             self.config_comp1 = cfg.get("config_int4", self.config_comp1)
             self.config_comm0 = cfg.get("config_int4", self.config_comm0)
             self.config_comm1 = cfg.get("config_fp16", self.config_comm1)
-        
+            self.config_ffn_text = cfg.get("config_int4", self.config_ffn_text)
+
         self.log_path = cfg.get("log_path", self.log_path)
         self.result_path = cfg.get("result_path", self.result_path)
         image_len = cfg.get("image_len", self.image_input_len)
@@ -188,6 +248,20 @@ class Janus_sim():
         self.array_height = cfg.get("array_height", self.array_height)
         self.array_width = cfg.get("array_width", self.array_width)
         self.array_width_half = cfg.get("array_width_half", self.array_width)
+        # FP-FP-only width for image-stage qkv/omap (weights unquantized);
+        # FFN keeps the dual-array width only when T3 is on. Mirrors Bagel_sim.
+        self.array_width_fp = cfg.get("array_width_fp", self.array_width)
+        # Image-stage qkv/omap width: full dual array with quant_proj, else
+        # FP-FP only. Mirrors Bagel_sim.
+        if self.hardware_type == 'ours' and self.quant_proj:
+            self.array_width_proj = self.array_width
+        else:
+            self.array_width_proj = self.array_width_fp
+        if self.hardware_type == 'ours' and not self.t3_soft:
+            self.array_width_ffn = self.array_width_fp
+        else:
+            self.array_width_ffn = self.array_width
+        self.peak_dram_gbps = cfg.get("peak_dram_gbps", self.peak_dram_gbps)
 
         self.sparsity_kv = cfg.get("sparsity", self.sparsity_kv)
         self.sparsity_cross_attn = cfg.get("sparsity_cross_attn", self.sparsity_cross_attn)
@@ -305,7 +379,8 @@ class Janus_sim():
 
         s = scalesim(
             save_disk_space=True,
-            verbose=True,
+            verbose=True,   # NB: upstream couples verbose into the result —
+                            # verbose=False makes run_scale return 0 cycles.
             config=config,
             topology=topology_path,
             layout=os.path.join(PROJECT_ROOT, "layouts", "GEMM_mnk", "vit_l_KM_KN.csv"),
@@ -320,6 +395,27 @@ class Janus_sim():
         else:
             return results
     
+    def _add_op(self, label, cycles):
+        """Accumulate per-operator cycle contribution (req 3 breakdown)."""
+        self.cycle_breakdown[label] = self.cycle_breakdown.get(label, 0.0) + cycles
+
+    def _format_cycle_breakdown(self):
+        """Per-operator cycle breakdown + % of end-to-end (req 3). See Bagel_sim."""
+        cb = self.cycle_breakdown
+        total = sum(cb.values())
+        if total <= 0:
+            return "CYCLE BREAKDOWN: none recorded"
+        lines = ["CYCLE BREAKDOWN (per-operator cycles / % of end-to-end):"]
+        for stage in ("text", "img"):
+            sub = sum(v for k, v in cb.items() if k.startswith(stage + "/"))
+            if sub > 0:
+                lines.append(f"  [{stage}] subtotal: {sub:,.0f}  ({100.0*sub/total:5.1f}%)")
+                for k in sorted(cb):
+                    if k.startswith(stage + "/"):
+                        lines.append(f"      OPBREAKDOWN {k} {cb[k]:.0f} {100.0*cb[k]/total:.3f}")
+        lines.append(f"  breakdown sum: {total:,.0f}  (total_cycles={self.total_cycles_all:,.0f})")
+        return "\n".join(lines)
+
     def _append_to_log(self, message):
         """追加信息到日志文件"""
         # 确保结果目录存在
@@ -335,49 +431,112 @@ class Janus_sim():
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(log_entry)
         
-        print(log_entry.strip())  
-        
+        print(log_entry.strip())
+
+    # --- analytical memory-bound text-decode model (mirrors Bagel_sim, 2026-06-17).
+    # SCALE-Sim's os mapping wastes ~31/32 of the array for M=1 decode, hiding all
+    # memory traffic so no bandwidth knob binds. Physically a well-mapped M=1 GEMV
+    # fills the array and is then bounded by streaming its weights/KV from DRAM. We
+    # model each text GEMM as max(ideal-fill compute, operand stream). See
+    # devlog_rebuttal/docs/NEED9_DISAGG.md §6. Janus has no GQA (num_head_q==num_head_kv)
+    # and no disagg hw type, so the KV-reuse caveat and disagg branch don't apply.
+    _PREC_BYTES = {"fp16": 2.0, "int8": 1.0, "int4": 0.5}
+
+    def _text_array_macs(self):
+        """MACs/cycle the text stage can use (array assumed fully mapped for M=1)."""
+        h = self.array_height or 32
+        if self.hardware_type == 'ours':
+            # text runs on the FP-FP sub-array only (FP-INT4 array idle).
+            return h * (self.array_width_fp or self.array_width)
+        return h * self.array_width
+
+    def _text_bw_bpc(self):
+        """Off-chip bytes/cycle for the text stage (peak_dram_gbps @ 500 MHz)."""
+        return self.peak_dram_gbps * 1e9 / 500_000_000.0
+
+    def _text_gemm_cycles(self, M, N, K, w_bytes, bw_bpc, array_macs, act_bytes=None):
+        """One M-row text GEMM: max(ideal-fill compute, operand-stream).
+        compute = M*N*K / array_macs;
+        stream = (N*K*w_bytes + M*K*act + M*N*act)/bw_bpc — all off-chip operands
+        once (weights/KV dominate for M=1; activation terms keep mem-util ≤100%)."""
+        if act_bytes is None: act_bytes = w_bytes
+        compute = (M * N * K) / array_macs
+        stream = (N * K * w_bytes + M * K * act_bytes + M * N * act_bytes) / bw_bpc
+        return max(compute, stream)
+
     def run_gen_text(self):
         self._append_to_log(f"=========== Text Generation Started (total steps: {self.gen_text_len}) ===========")
         text_start_cycles = self.total_cycles_all
 
-        self._append_to_log(f"Text generation - Start qkv mapping")
-        input_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='qkv', config=self.config_comm0)
-        input_cycles = input_tile_cycles * (self.dim + self.num_head_kv * self.head_dim * 2) / self.tile
-        self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
-
-        # Energy: precision tags + once-only multiplicities (mirrors Bagel).
+        # Energy: per-operand precision + once-only multiplicities (mirrors
+        # Bagel_sim.run_gen_text — see the comment there).
         from simulation_core.energy_accounting.coefficients import precision_from_config_path
         prec_comm0 = precision_from_config_path(self.config_comm0)
         prec_comm1 = precision_from_config_path(self.config_comm1)
+        if self.hardware_type == 'ours':
+            if self.quant_proj:
+                proj_kwargs = {"precision": "fp16", "weight_precision": "int4",
+                               "mac_split": {"w4a16": 1.0}}
+            else:
+                proj_kwargs = {"precision": "fp16"}
+            ffn_kwargs = {"precision": "fp16"}
+            if self.t3_soft:
+                if self.task == 'MM':
+                    # figna-aligned W4A16 FFN for pure-text MM (see read_from_json):
+                    # INT4 weights × fp16 activations, MACs billed as w4a16.
+                    ffn_kwargs["weight_precision"] = "int4"
+                    ffn_kwargs["mac_split"] = {"w4a16": 1.0}
+                else:
+                    ffn_kwargs["weight_precision"] = "int8"
+        elif self.hardware_type in ('figna', 'axcore'):
+            proj_kwargs = {"precision": "fp16", "weight_precision": "int4",
+                           "mac_split": {"w4a16": 1.0}}
+            ffn_kwargs = dict(proj_kwargs)
+        else:
+            proj_kwargs = {"precision": prec_comm0}
+            ffn_kwargs = {"precision": precision_from_config_path(self.config_ffn_text)}
         once_mult = self.num_layer * self.gen_text_len
         qkv_N = self.dim + 2 * self.num_head_kv * self.head_dim
+
+        # Analytical memory-bound text model (mirrors Bagel_sim): cycles per GEMM =
+        # max(ideal-fill compute, operand-stream/BW). Replaces the SCALE-Sim os runs.
+        bw_bpc = self._text_bw_bpc()
+        tmacs = self._text_array_macs()
+        proj_wb = self._PREC_BYTES.get(
+            proj_kwargs.get("weight_precision") or proj_kwargs.get("precision", "fp16"), 2.0)
+        ffn_wb = self._PREC_BYTES.get(
+            ffn_kwargs.get("weight_precision") or ffn_kwargs.get("precision", "fp16"), 2.0)
+        kv_wb = self._PREC_BYTES.get(prec_comm1, 2.0)   # KV cache at attn precision
+        proj_ab = self._PREC_BYTES.get(proj_kwargs.get("precision","fp16"),2.0)
+        ffn_ab = self._PREC_BYTES.get(ffn_kwargs.get("precision","fp16"),2.0)
+
+        self._append_to_log(f"Text generation - Start qkv mapping")
+        input_cycles = self._text_gemm_cycles(1, qkv_N, self.dim, proj_wb, bw_bpc, tmacs, proj_ab)
         self._record_energy(M=1, N=qkv_N, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult,
-                            label="text/qkv", hw_cfg_path=self.config_comm0)
+                            multiplicity=once_mult, label="text/qkv",
+                            hw_cfg_path=self.config_comm0, **proj_kwargs)
+        self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
 
         self._append_to_log(f"Text generation - Start output mapping")
-        output_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='omap', config=self.config_comm0)
-        output_cycles = output_tile_cycles * self.dim / self.tile
+        output_cycles = self._text_gemm_cycles(1, self.dim, self.dim, proj_wb, bw_bpc, tmacs, proj_ab)
         self._record_energy(M=1, N=self.dim, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult,
-                            label="text/omap", hw_cfg_path=self.config_comm0)
+                            multiplicity=once_mult, label="text/omap",
+                            hw_cfg_path=self.config_comm0, **proj_kwargs)
         self._append_to_log(f"Text generation - End output mapping, total cycles:{output_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN up")
-        ffn_up_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_up', config=self.config_comm0)
-        ffn_up_cycles = ffn_up_tile_cycles * self.upshape / self.tile
-        self._record_energy(M=1, N=self.upshape, K=self.dim,
-                            precision=prec_comm0, multiplicity=once_mult,
-                            label="text/ffn_up", hw_cfg_path=self.config_comm0)
+        # Gated FFN (Janus): gate + up are two same-shape projections, so ×2.
+        ffn_up_cycles = self._text_gemm_cycles(1, self.upshape, self.dim, ffn_wb, bw_bpc, tmacs, ffn_ab) * 2
+        self._record_energy(M=1, N=self.upshape, K=self.dim, scale=2.0,
+                            multiplicity=once_mult, label="text/ffn_up_gate+up",
+                            hw_cfg_path=self.config_ffn_text, **ffn_kwargs)
         self._append_to_log(f"Text generation - End FFN up, total cycles:{ffn_up_cycles}")
 
         self._append_to_log(f"Text generation - Start FFN down")
-        ffn_down_tile_cycles = self.run_sim_once(kv_length=0, is_gen_text=True, part='ffn_down', config=self.config_comm0)
-        ffn_down_cycles = ffn_down_tile_cycles * self.dim / self.tile
+        ffn_down_cycles = self._text_gemm_cycles(1, self.dim, self.upshape, ffn_wb, bw_bpc, tmacs, ffn_ab)
         self._record_energy(M=1, N=self.dim, K=self.upshape,
-                            precision=prec_comm0, multiplicity=once_mult,
-                            label="text/ffn_down", hw_cfg_path=self.config_comm0)
+                            multiplicity=once_mult, label="text/ffn_down",
+                            hw_cfg_path=self.config_ffn_text, **ffn_kwargs)
         self._append_to_log(f"Text generation - End FFN down, total cycles:{ffn_down_cycles}")
 
         for step in range(0, self.gen_text_len, self.sample_rate):
@@ -393,10 +552,10 @@ class Janus_sim():
 
             results_this_iter = 0
             results_this_iter += input_cycles
-            attn_qk_tile_single_cycle = self.run_sim_once(kv_length=kv_len, is_gen_text=True, part='attn_qk', config=self.config_comm1)
-            attn_qk_single_cycle = attn_qk_tile_single_cycle * kv_len / self.tile
-            attn_sfmxv_tile_single_cycle = self.run_sim_once(kv_length=kv_len, is_gen_text=True, part='attn_sfmxv', config=self.config_comm1)
-            attn_sfmxv_single_cycle = attn_sfmxv_tile_single_cycle * self.head_dim / self.tile
+            # Attention (M=1 per query): reads K/V cache from DRAM (kv_len×head_dim
+            # each, at kv precision) — KV-bandwidth-bound. Mirrors Bagel_sim.
+            attn_qk_single_cycle = self._text_gemm_cycles(1, kv_len, self.head_dim, kv_wb, bw_bpc, tmacs, kv_wb)
+            attn_sfmxv_single_cycle = self._text_gemm_cycles(1, self.head_dim, kv_len, kv_wb, bw_bpc, tmacs, kv_wb)
             attn_single_cycle = attn_qk_single_cycle + attn_sfmxv_single_cycle
             attn_cycles = attn_single_cycle * self.num_head_q
             results_this_iter += attn_cycles
@@ -409,6 +568,13 @@ class Janus_sim():
             step_cnts = step_end - step + 1
             step_cycles_total = step_cycles * step_cnts
             self.total_cycles_all += step_cycles_total
+
+            opmul = self.num_layer * step_cnts
+            self._add_op("text/qkv", input_cycles * opmul)
+            self._add_op("text/attn", attn_cycles * opmul)
+            self._add_op("text/omap", output_cycles * opmul)
+            self._add_op("text/ffn_up", ffn_up_cycles * opmul)
+            self._add_op("text/ffn_down", ffn_down_cycles * opmul)
 
             # Energy: per-step attention (multiplicity = num_layer × step_cnts × num_head_q).
             attn_mult = self.num_layer * step_cnts * self.num_head_q
@@ -442,21 +608,27 @@ class Janus_sim():
             prefetch_cycles = max(prefetch_cycles_a, prefetch_cycles_b)
             cycle_result += prefetch_cycles
 
+        # qkv/omap width = array_width_proj (set in read_from_json): with
+        # quant_proj the INT4 projection weights let both sub-arrays compute
+        # them at the merged array_width (W4A16); without quant_proj they fall
+        # back to the FP-FP-only array_width_fp. The FFN uses array_width_ffn
+        # (the INT4+BF16 dual-array merge under T3). Mirrors
+        # Bagel_sim.run_sim_once_comp.
         if part in ['all', 'qkv']:
             Qmap_row_fold = math.ceil(self.vae_attn/self.array_height)
-            Qmap_col_fold = math.ceil(self.dim/self.array_width)
-            Qmap_cycle_each_fold = self.dim + self.array_height + self.array_width - 2
+            Qmap_col_fold = math.ceil(self.dim/self.array_width_proj)
+            Qmap_cycle_each_fold = self.dim + self.array_height + self.array_width_proj - 2
             Qmap_cycles = Qmap_cycle_each_fold * Qmap_col_fold * Qmap_row_fold
 
             cycle_result += Qmap_cycles
 
             KVmap_row_fold = math.ceil(self.vae_attn/self.array_height)
-            KVmap_col_fold = math.ceil(self.num_head_kv * self.head_dim/self.array_width)
-            KVmap_cycle_each_fold = self.dim + self.array_height + self.array_width - 2
+            KVmap_col_fold = math.ceil(self.num_head_kv * self.head_dim/self.array_width_proj)
+            KVmap_cycle_each_fold = self.dim + self.array_height + self.array_width_proj - 2
             KVmap_cycles = KVmap_cycle_each_fold * KVmap_col_fold * KVmap_row_fold
 
             cycle_result += 2 * KVmap_cycles
-            
+
 
         # Multi-head attention操作
         if part in ['all', 'attn']:
@@ -477,12 +649,12 @@ class Janus_sim():
         if part in ['all', 'omap']:
             # 输出映射
             Omap_row_fold = math.ceil(layer_input/self.array_height)
-            Omap_col_fold = math.ceil(self.dim/self.array_width)
-            Omap_cycle_each_fold = self.dim + self.array_height + self.array_width - 2
+            Omap_col_fold = math.ceil(self.dim/self.array_width_proj)
+            Omap_cycle_each_fold = self.dim + self.array_height + self.array_width_proj - 2
             Omap_cycles = Omap_cycle_each_fold * Omap_col_fold * Omap_row_fold
 
             cycle_result += Omap_cycles
-    
+
 
         if part in ['all', 'ffn_up']:
             if which_ffn == 'without_img':
@@ -492,16 +664,16 @@ class Janus_sim():
             else:
                 layer = layer_input
             FFN_up_row_fold = math.ceil(layer/self.array_height)
-            FFN_up_col_fold = math.ceil(self.upshape/self.array_width)
-            FFN_up_cycle_each_fold = self.dim + self.array_height + self.array_width - 2
+            FFN_up_col_fold = math.ceil(self.upshape/self.array_width_ffn)
+            FFN_up_cycle_each_fold = self.dim + self.array_height + self.array_width_ffn - 2
             FFN_up_cycles = FFN_up_cycle_each_fold * FFN_up_col_fold * FFN_up_row_fold
 
             cycle_result += FFN_up_cycles * 2
 
         if part in ['all', 'ffn_down']:
             FFN_down_row_fold = math.ceil(layer_input/self.array_height)
-            FFN_down_col_fold = math.ceil(self.upshape/self.array_width)
-            FFN_down_cycle_each_fold = self.dim + self.array_height + self.array_width - 2
+            FFN_down_col_fold = math.ceil(self.upshape/self.array_width_ffn)
+            FFN_down_cycle_each_fold = self.dim + self.array_height + self.array_width_ffn - 2
             FFN_down_cycles = FFN_down_cycle_each_fold * FFN_down_col_fold * FFN_down_row_fold
 
             cycle_result += FFN_down_cycles
@@ -522,20 +694,27 @@ class Janus_sim():
         kv_without_text_full = self.image_input_len
 
         if self.hardware_type == "ours":
-            kv_cross_attn = self.kv_cache_init + self.gen_text_len
-            kv_remain_cross_attn = int(kv_cross_attn * self.sparsity_cross_attn)
-            kv_low_prec_self_attn = int(self.image_input_len * self.low_precise_self_attn)
-            kv_low_prec_attn = kv_remain_cross_attn + kv_low_prec_self_attn
-            kv_high_prec_attn = self.image_input_len - kv_low_prec_self_attn
-            kv_normal = max(kv_low_prec_attn, kv_high_prec_attn)
-            kv_without_text = max(int((self.kv_cache_without_text + self.gen_text_len) * self.sparsity_cross_attn) + kv_low_prec_self_attn, kv_high_prec_attn)
+            if not self.t1_soft:
+                # T1 off: single full-precision path over the full KV.
+                kv_normal = kv_normal_full
+                kv_without_text = kv_without_text_full
+            elif self.t1_hard:
+                # T1 hard on: HSD load-balances the surviving attention work
+                # evenly across the two arrays (formerly 'ours_balenced').
+                kv_cross_attn = self.kv_cache_init + self.gen_text_len
+                kv_remain_cross_attn = int(kv_cross_attn * self.sparsity_cross_attn)
+                kv_normal = int((kv_remain_cross_attn + self.image_input_len) / 2)
+                kv_without_text = int(((self.kv_cache_without_text + self.gen_text_len) * self.sparsity_cross_attn + self.image_input_len) / 2)
+            else:
+                # T1 hard off: dispatch only, makespan = max(two paths).
+                kv_cross_attn = self.kv_cache_init + self.gen_text_len
+                kv_remain_cross_attn = int(kv_cross_attn * self.sparsity_cross_attn)
+                kv_low_prec_self_attn = int(self.image_input_len * self.low_precise_self_attn)
+                kv_low_prec_attn = kv_remain_cross_attn + kv_low_prec_self_attn
+                kv_high_prec_attn = self.image_input_len - kv_low_prec_self_attn
+                kv_normal = max(kv_low_prec_attn, kv_high_prec_attn)
+                kv_without_text = max(int((self.kv_cache_without_text + self.gen_text_len) * self.sparsity_cross_attn) + kv_low_prec_self_attn, kv_high_prec_attn)
 
-        elif self.hardware_type == "ours_balenced":
-            kv_cross_attn = self.kv_cache_init + self.gen_text_len
-            kv_remain_cross_attn = int(kv_cross_attn * self.sparsity_cross_attn)
-            kv_normal = int((kv_remain_cross_attn + self.image_input_len) / 2)
-            kv_without_text = int(((self.kv_cache_without_text + self.gen_text_len) * self.sparsity_cross_attn + self.image_input_len) / 2)
-        
         elif self.hardware_type == "sdma":
             kv_normal = int(kv_normal_full * self.sparsity_kv)
             kv_without_text = int(kv_without_text_full * self.sparsity_kv)
@@ -560,6 +739,27 @@ class Janus_sim():
         # config, so per-config multiplicity = num_layer × gen_image_step.
         from simulation_core.energy_accounting.coefficients import precision_from_config_path
         prec_comp0 = precision_from_config_path(self.config_comp0)
+        # Per-operand precision for the image stage (mirrors Bagel_sim):
+        # qkv/omap weights unquantized; ours' T3 bills the FFN as INT4+BF16
+        # dual-array (weights 0.5B, MACs 50/50); figna stays W4A16.
+        if self.hardware_type == 'ours':
+            if self.quant_proj:
+                img_proj_kwargs = {"precision": "fp16", "weight_precision": "int4",
+                                   "mac_split": {"w4a16": 1.0}}
+            else:
+                img_proj_kwargs = {"precision": "fp16"}
+            if self.t3_soft:
+                img_ffn_kwargs = {"precision": "fp16", "weight_precision": "int4",
+                                  "mac_split": {"fp16": 0.5, "w4a16": 0.5}}
+            else:
+                img_ffn_kwargs = {"precision": "fp16"}
+        elif self.hardware_type in ('figna', 'axcore'):
+            img_proj_kwargs = {"precision": "fp16", "weight_precision": "int4",
+                               "mac_split": {"w4a16": 1.0}}
+            img_ffn_kwargs = dict(img_proj_kwargs)
+        else:
+            img_proj_kwargs = {"precision": prec_comp0}
+            img_ffn_kwargs = {"precision": prec_comp0}
         n_steps = self.gen_image_step
         kv_proj_N = self.num_head_kv * self.head_dim
 
@@ -572,6 +772,7 @@ class Janus_sim():
         self._append_to_log(f"Image generation - End draining, total cycles:{drain_cycles}")
 
         total_image_cycles += prefetch_cycles
+        self._add_op("img/prefetch", prefetch_cycles * n_steps)
 
         for config_name, kv_len, input_len in kv_configs:
             self._append_to_log(f"Image generation - {config_name} config started (kv_len: {kv_len})")
@@ -583,14 +784,14 @@ class Janus_sim():
             input_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='qkv', image_input=input_len)
             # qkv: Q (input_len, dim, dim) + 2× KV (input_len, num_head_kv·head_dim, dim)
             self._record_energy(M=input_len, N=self.dim, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
-                                label=f"img/qkv_Q({config_name})", hw_cfg_path=self.config_comp0)
+                                multiplicity=per_cfg_mult, label=f"img/qkv_Q({config_name})",
+                                hw_cfg_path=self.config_comp0, **img_proj_kwargs)
             self._record_energy(M=input_len, N=kv_proj_N, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
-                                label=f"img/qkv_K({config_name})", hw_cfg_path=self.config_comp0)
+                                multiplicity=per_cfg_mult, label=f"img/qkv_K({config_name})",
+                                hw_cfg_path=self.config_comp0, **img_proj_kwargs)
             self._record_energy(M=input_len, N=kv_proj_N, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
-                                label=f"img/qkv_V({config_name})", hw_cfg_path=self.config_comp0)
+                                multiplicity=per_cfg_mult, label=f"img/qkv_V({config_name})",
+                                hw_cfg_path=self.config_comp0, **img_proj_kwargs)
             self._append_to_log(f"Text generation - End qkv mapping, total cycles:{input_cycles}")
             config_cycles_iter += input_cycles
 
@@ -612,46 +813,58 @@ class Janus_sim():
             self._append_to_log(f"Image generation - Start output mapping")
             output_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='omap', image_input=input_len)
             self._record_energy(M=input_len, N=self.dim, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
-                                label=f"img/omap({config_name})", hw_cfg_path=self.config_comp0)
+                                multiplicity=per_cfg_mult, label=f"img/omap({config_name})",
+                                hw_cfg_path=self.config_comp0, **img_proj_kwargs)
             self._append_to_log(f"Image generation - End output mapping, total cycles:{output_cycles}")
             config_cycles_iter += output_cycles
 
             self._append_to_log(f"Image generation - Start FFN up")
-            ffn_up_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_up',which_ffn=config_name, image_input=input_len)
+            # Janus only runs GenEval (2 branches: full_cache + without_text),
+            # so there is no 3-branch full_cache reuse extension as in Bagel.
+            # t2_soft off (ARGUS ablation): no reuse shrink on any branch.
+            ffn_branch = config_name if self.t2_soft else "no_reuse"
+            ffn_up_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_up',which_ffn=ffn_branch, image_input=input_len)
             # ffn_up: layer_input depends on which_ffn mask, recorded twice (gate + up).
-            if config_name == "without_img":
+            if ffn_branch == "without_img":
                 layer_eff = input_len * (1 - self.text_only_sim)
-            elif config_name == "without_text":
+            elif ffn_branch == "without_text":
                 layer_eff = input_len * (1 - self.image_only_sim)
             else:
                 layer_eff = input_len
             self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                multiplicity=per_cfg_mult,
                                 label=f"img/ffn_up_gate({config_name})",
-                                hw_cfg_path=self.config_comp0)
+                                hw_cfg_path=self.config_comp0, **img_ffn_kwargs)
             self._record_energy(M=int(layer_eff), N=self.upshape, K=self.dim,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                multiplicity=per_cfg_mult,
                                 label=f"img/ffn_up_proj({config_name})",
-                                hw_cfg_path=self.config_comp0)
+                                hw_cfg_path=self.config_comp0, **img_ffn_kwargs)
             self._append_to_log(f"Image generation - End FFN up, total cycles:{ffn_up_cycles}")
             config_cycles_iter += ffn_up_cycles
 
             self._append_to_log(f"Image generation - Start FFN down")
             ffn_down_cycles = self.run_sim_once_comp(kv_len=0, is_gen_text=False, part='ffn_down', image_input=input_len)
             self._record_energy(M=input_len, N=self.dim, K=self.upshape,
-                                precision=prec_comp0, multiplicity=per_cfg_mult,
+                                multiplicity=per_cfg_mult,
                                 label=f"img/ffn_down({config_name})",
-                                hw_cfg_path=self.config_comp0)
+                                hw_cfg_path=self.config_comp0, **img_ffn_kwargs)
             self._append_to_log(f"Image generation - End FFN down, total cycles:{ffn_down_cycles}")
             config_cycles_iter += ffn_down_cycles
             
             config_cycles = config_cycles_iter * self.num_layer
             total_image_cycles += config_cycles
-            
+
+            opmul = self.num_layer * n_steps
+            self._add_op("img/qkv", input_cycles * opmul)
+            self._add_op("img/attn", attn_cycles * opmul)
+            self._add_op("img/omap", output_cycles * opmul)
+            self._add_op("img/ffn_up", ffn_up_cycles * opmul)
+            self._add_op("img/ffn_down", ffn_down_cycles * opmul)
+
             self._append_to_log(f"Image generation - {config_name} config completed, cycles: {config_cycles}")
 
         total_image_cycles += drain_cycles
+        self._add_op("img/drain", drain_cycles * n_steps)
 
         # 乘以生成步数
         final_image_cycles = total_image_cycles * self.gen_image_step
@@ -662,9 +875,11 @@ class Janus_sim():
 
 
     def run_model(self):
-        """运行完整的Bagel模型仿真"""
-        # 清空之前的日志文件
-        log_file = os.path.join(self.result_path, "results.log")
+        """运行完整的Janus模型仿真"""
+        # 清空之前的日志文件。result_path 是文件路径（与 _append_to_log 一致），不是目录——
+        # 历史上这里写成 os.path.join(result_path, "results.log") 得到一个永不存在的路径，
+        # os.remove 从不执行 → 日志被 append 污染。直接用 result_path 即可。
+        log_file = self.result_path
         if os.path.exists(log_file):
             os.remove(log_file)
         
@@ -676,7 +891,8 @@ class Janus_sim():
         
         # 重置总周期数
         self.total_cycles_all = 0
-        
+        self.cycle_breakdown = {}
+
         # 运行文本生成
         if self.text_gen_finished_flag:
             self._append_to_log(f"=========== Text Generation Started (total steps: {self.gen_text_len}) ===========")
@@ -687,7 +903,8 @@ class Janus_sim():
             # 运行文本生成
             self.run_gen_text()
         
-        if self.task == "GenEdit" or self.task == "GenImage":
+        # GenEval 也含图像阶段 (Janus 无 GenEdit)。2026-06-12 修核对项7。
+        if self.task in ("GenEdit", "GenImage", "GenEval"):
             # 运行图像生成
             self.run_gen_image()
         
@@ -698,6 +915,7 @@ class Janus_sim():
         self._append_to_log("=" * 50)
         self._append_to_log(f"FINAL RESULT - Total Cycles: {self.total_cycles_all}, total seconds: {self.total_cycles_all/500000000}")
         self._append_to_log(f"Simulation Duration: {duration:.2f} seconds")
+        self._append_to_log(self._format_cycle_breakdown())
 
         # Energy report (Phase F).
         if self.energy_enabled and self.energy is not None:

@@ -3,7 +3,6 @@
     "gen_text_len": 229,
     "gen_image_step": 50,
     "config": "./configs/bagel/base.cfg",
-    "config_comp": "./configs/bagel/base_compute.cfg",
     "log_path": "./results",
     "result_path": "./results/bagel/results_base.log",
     "image_len": 3193,

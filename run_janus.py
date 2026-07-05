@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Bagel Simulation")
 
     parser.add_argument('--hw', type=str, default='ours', 
-                        choices=['ours', 'ours_balence', 'sdma', 'flightvgm', 'figna'],
+                        choices=['ours', 'sdma', 'flightvgm', 'figna', 'axcore', 'base'],
                         help='Hardware architecture type')
     
     parser.add_argument('--task', type=str, default='GenEval',

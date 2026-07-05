@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Bagel Simulation")
 
     parser.add_argument('--hw', type=str, default='ours', 
-                        choices=['ours', 'ours_balence', 'sdma', 'flightvgm', 'figna', 'base'],
+                        choices=['ours', 'sdma', 'flightvgm', 'figna', 'axcore', 'base', 'disagg'],
                         help='Hardware architecture type')
     
     parser.add_argument('--task', type=str, default='GenEval',
@@ -31,6 +31,12 @@ def main():
                         help='With --energy, also call accelergy CLI per sub-run to '
                              'cross-validate the EnergyAccountant numbers. Slow.')
 
+    parser.add_argument('--batch', type=int, default=None,
+                        help='Override batch_size for the Need-6 batch sweep '
+                             '(decode batching: projections/FFN batched as M=batch, '
+                             'attention and image stage scale x batch). Overrides '
+                             'the JSON "batch_size". Energy is disabled when >1.')
+
     args = parser.parse_args()
     print(f"Starting Bagel Simulation...")
     print(f"Hardware: {args.hw}")
@@ -44,6 +50,11 @@ def main():
 
     # 读取JSON配置
     bagel.read_from_json(cfg_path=args.config)
+
+    # CLI --batch overrides JSON batch_size (Need-6 batch sweep).
+    if args.batch is not None:
+        bagel.batch_size = args.batch
+        print(f"Batch:    {bagel.batch_size}")
 
     # CLI --energy overrides JSON energy_enabled. Set up the accountant
     # (defaults from coefficients.py merged with JSON energy_coefficients).
